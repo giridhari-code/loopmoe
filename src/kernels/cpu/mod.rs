@@ -1,1 +1,1 @@
-// CPU SIMD fallback kernels
+//! Future: Fertile CPU SIMD / rayon paths.

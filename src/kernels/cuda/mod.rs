@@ -1,2 +1,1 @@
-// CUDA specific kernels will go here
-// Using cudarc or candle-cuda under the hood for now
+//! Future: Fertile CUDA backend (grouped GEMM / device dispatch).

@@ -1,33 +1,55 @@
 # LoopMoE
 
-**MoE + Looped Transformer** inference framework in pure Rust.
+Inference framework for **Looped Transformer + Shared/Routed MoE**.
 
-- GPU first (CUDA) + CPU fallback
-- Safetensors weights
-- loop_count default **24**
-- DeepSeek-style shared + routed MoE
-- **RoPE + KV cache** generation path
+Kernel: **Fertile** (`src/kernels/fertile`)
+
+## Pipeline
+
+```
+input_ids
+  → embed
+  → loop × loop_count:
+        RMSNorm → Attention(RoPE, KV-cache) → residual
+        RMSNorm → Fertile MoE (shared + top-k routed) → residual
+  → RMSNorm → lm_head → logits
+  → generate: prefill → decode (cache)
+```
+
+## Fertile MoE
+
+```
+y = Shared(x) + scale * Σ top-k routed experts
+```
+
+- Shared experts: always on, one pass
+- Routed: top-k → expert-grouped buckets → **one run per expert**
+- Name: `kernels::KERNEL_NAME == "Fertile"`
+
+## Defaults
+
+| | |
+|--|--|
+| loop_count | 24 |
+| n_routed_experts | 64 |
+| n_shared_experts | 2 |
+| num_experts_per_tok | 6 |
+| weights | safetensors |
+| device | CUDA → CPU fallback |
 
 ## Status
 
-- [x] RoPE (rotary embeddings)
-- [x] KV cache (prefill + decode)
-- [x] Shared + Routed MoE + fused path
-- [ ] DeepEP-style CUDA kernels
-- [ ] PagedAttention / continuous batching
-- [ ] Tokenizer + sampling
-- [ ] OpenAI server
+- [x] Fertile MoE kernel path
+- [x] RoPE + KV cache generation
+- [x] Shared + routed experts
+- [ ] Fertile CUDA backend
+- [ ] Tokenizer / sampling / server
 
-## Generation
-
-```
-1. Prefill(prompt) → LayerCaches
-2. Decode(token)   → append cache, full-history attention
-```
-
-Looped model: cache written only on **last** loop iteration.
+## Build
 
 ```bash
 cargo build --release
 cargo run --release -- --model /path/to/model.safetensors
 ```
+
+Checkpoint experts: `0..n_routed-1` routed, then shared.

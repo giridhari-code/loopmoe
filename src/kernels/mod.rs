@@ -1,16 +1,10 @@
-//! LoopMoE specialized compute paths.
+//! Compute backends for LoopMoE.
 //!
-//! Currently the main optimized path lives in `model::moe::MoeLayer::forward`:
-//!   - Shared experts once
-//!   - Expert-wise token grouping (not K×E launches)
-//!   - Each routed expert runs exactly once
-//!   - Scaled scatter-add combine
-//!
-//! That is the **single fused kernel path** tuned for this Looped + Shared/Routed MoE model.
-//!
-//! Future:
-//!   cuda/  → real CUDA / DeepEP-style dispatch + grouped GEMM
-//!   cpu/   → SIMD / rayon fallbacks
+//! Primary kernel: **Fertile** — model-specific MoE dispatch
+//! (`kernels::fertile`).
 
+pub mod fertile;
 pub mod cuda;
 pub mod cpu;
+
+pub use fertile::{fertile_moe, FertileDispatch, FertileMoeParams, KERNEL_NAME};
