@@ -2,40 +2,28 @@
 name = "loopmoe"
 version = "0.1.0"
 edition = "2021"
-description = "High-performance MoE + Looped Transformer inference framework in Rust"
+description = "High-performance MoE + Looped Transformer inference — Fertile kernel"
 license = "Apache-2.0"
 
 [dependencies]
-# Core tensor + device (CUDA preferred)
-candle-core = { version = "0.8", default-features = false, features = ["cuda"] }
+candle-core = { version = "0.8", default-features = false }
 candle-nn = "0.8"
-
-# Safetensors
 safetensors = "0.4"
 memmap2 = "0.9"
-
-# Config & serde
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# CLI
 clap = { version = "4", features = ["derive"] }
-
-# Error handling
 anyhow = "1"
 thiserror = "1"
-
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# Random for sampling
 rand = "0.8"
 half = "2"
 
 [features]
 default = ["cuda"]
-cuda = []
+cuda = ["candle-core/cuda"]
+arm = []
 cpu = []
 
 [[bin]]
