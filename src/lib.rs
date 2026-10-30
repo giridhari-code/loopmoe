@@ -1,4 +1,4 @@
-//! **Sentinel v1.0** — Looped MoE inference (Fertile kernel).
+//! **Sentinel v1.0** — Looped MoE inference (Fertile) + Rust training.
 
 pub mod config;
 pub mod model;
@@ -7,6 +7,7 @@ pub mod cache;
 pub mod engine;
 pub mod sampler;
 pub mod tokenizer;
+pub mod train;
 
 pub use config::ModelConfig;
 pub use engine::InferenceEngine;

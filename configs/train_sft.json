@@ -1,0 +1,8 @@
+{
+  "stage": "sft",
+  "data_path": "data/sft.jsonl",
+  "output_dir": "outputs/sft",
+  "init_from": "outputs/midtrain/final",
+  "max_steps": 500,
+  "lr": 0.00002
+}

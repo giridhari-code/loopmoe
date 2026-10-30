@@ -2,7 +2,7 @@
 name = "loopmoe"
 version = "1.0.0"
 edition = "2021"
-description = "Sentinel v1.0 — Looped MoE inference with Fertile kernel"
+description = "Sentinel v1.0 — Looped MoE inference + Rust training"
 license = "Apache-2.0"
 
 [dependencies]
@@ -33,6 +33,10 @@ path = "src/main.rs"
 [[bin]]
 name = "loopmoe"
 path = "src/main.rs"
+
+[[bin]]
+name = "sentinel-train"
+path = "src/bin/sentinel_train.rs"
 
 [[example]]
 name = "offline_infer"

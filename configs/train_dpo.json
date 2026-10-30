@@ -1,0 +1,9 @@
+{
+  "stage": "dpo",
+  "data_path": "data/dpo.jsonl",
+  "output_dir": "outputs/dpo",
+  "init_from": "outputs/sft/final",
+  "max_steps": 200,
+  "lr": 5e-7,
+  "dpo_beta": 0.1
+}

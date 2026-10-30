@@ -1,0 +1,9 @@
+{
+  "stage": "midtrain",
+  "data_path": "data/midtrain.jsonl",
+  "output_dir": "outputs/midtrain",
+  "init_from": "outputs/pretrain/final",
+  "max_steps": 500,
+  "max_seq_len": 1024,
+  "lr": 0.00005
+}
