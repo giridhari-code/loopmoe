@@ -14,5 +14,6 @@ pub mod tokenizer;
 pub use config::ModelConfig;
 pub use engine::InferenceEngine;
 pub use model::LoopedMoE;
+pub use cache::{KvCache, LayerCaches};
 
 pub type Result<T> = anyhow::Result<T>;
