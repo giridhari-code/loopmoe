@@ -1,9 +1,7 @@
 use candle_core::{Result as CandleResult, Tensor};
 use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
 use crate::config::ModelConfig;
-use crate::kernels::fertile::{
-    fertile_moe, FertileExpert, FertileMoeParams, KERNEL_NAME,
-};
+use crate::kernels::fertile::{fertile_moe, FertileExpert, FertileMoeParams, KERNEL_NAME};
 
 pub struct Expert {
     w1: Linear,
@@ -30,7 +28,7 @@ impl FertileExpert for Expert {
     }
 }
 
-/// Thin wrapper — compute is Fertile.
+/// Sentinel v1.0 MoE — Fertile compute.
 pub struct MoeLayer {
     gate: Linear,
     routed_experts: Vec<Expert>,
@@ -55,14 +53,23 @@ impl MoeLayer {
             )?);
         }
 
+        // DeepInfer HF: shared_experts.{i}; Sentinel may pack as experts.{n_routed+i}
         let mut shared_experts = Vec::with_capacity(config.n_shared_experts);
         for i in 0..config.n_shared_experts {
             let idx = config.n_routed_experts + i;
-            shared_experts.push(Expert::load(
-                vb.pp(&format!("experts.{idx}")),
+            let expert = Expert::load(
+                vb.pp(&format!("shared_experts.{i}")),
                 config.hidden_size,
                 config.moe_intermediate_size,
-            )?);
+            )
+            .or_else(|_| {
+                Expert::load(
+                    vb.pp(&format!("experts.{idx}")),
+                    config.hidden_size,
+                    config.moe_intermediate_size,
+                )
+            })?;
+            shared_experts.push(expert);
         }
 
         let params = FertileMoeParams {
@@ -73,6 +80,7 @@ impl MoeLayer {
         };
 
         tracing::debug!(
+            model = %config.model_name,
             kernel = KERNEL_NAME,
             routed = config.n_routed_experts,
             shared = config.n_shared_experts,
