@@ -16,6 +16,7 @@ pub struct LoopedMoE {
 impl LoopedMoE {
     pub fn load(vb: VarBuilder, config: &ModelConfig, device: &Device) -> CandleResult<Self> {
         let dtype = vb.dtype();
+        let rope_len = config.max_seq_len.min(config.max_position_embeddings);
 
         let embed_tokens = candle_nn::embedding(
             config.vocab_size,
@@ -27,7 +28,7 @@ impl LoopedMoE {
         for i in 0..config.num_layers {
             let layer_rope = RotaryEmbedding::new(
                 config.head_dim,
-                config.max_position_embeddings,
+                rope_len,
                 config.rope_theta,
                 device,
                 dtype,
@@ -40,7 +41,19 @@ impl LoopedMoE {
         }
 
         let norm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
-        let lm_head = candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
+
+        let lm_head = if config.tie_word_embeddings {
+            match candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head")) {
+                Ok(l) => l,
+                Err(_) => candle_nn::linear(
+                    config.hidden_size,
+                    config.vocab_size,
+                    vb.pp("model.embed_tokens"),
+                )?,
+            }
+        } else {
+            candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
+        };
 
         Ok(Self {
             config: config.clone(),
@@ -52,7 +65,6 @@ impl LoopedMoE {
         })
     }
 
-    /// Cache updated only on the last loop iteration (one KV stream per physical layer).
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -73,7 +85,7 @@ impl LoopedMoE {
 
         let hidden = self.norm.forward(&hidden)?;
         let hidden = if seq_len > 1 {
-            hidden.i((.., seq_len - 1, ..))?
+            hidden.narrow(1, seq_len - 1, 1)?.squeeze(1)?
         } else {
             hidden.squeeze(1)?
         };

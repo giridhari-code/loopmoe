@@ -23,26 +23,10 @@ impl Attention {
     ) -> CandleResult<Self> {
         let head_dim = config.head_dim;
         Ok(Self {
-            q_proj: linear_no_bias(
-                config.hidden_size,
-                config.num_attention_heads * head_dim,
-                vb.pp("q_proj"),
-            )?,
-            k_proj: linear_no_bias(
-                config.hidden_size,
-                config.num_key_value_heads * head_dim,
-                vb.pp("k_proj"),
-            )?,
-            v_proj: linear_no_bias(
-                config.hidden_size,
-                config.num_key_value_heads * head_dim,
-                vb.pp("v_proj"),
-            )?,
-            o_proj: linear_no_bias(
-                config.num_attention_heads * head_dim,
-                config.hidden_size,
-                vb.pp("o_proj"),
-            )?,
+            q_proj: linear_no_bias(config.hidden_size, config.num_attention_heads * head_dim, vb.pp("q_proj"))?,
+            k_proj: linear_no_bias(config.hidden_size, config.num_key_value_heads * head_dim, vb.pp("k_proj"))?,
+            v_proj: linear_no_bias(config.hidden_size, config.num_key_value_heads * head_dim, vb.pp("v_proj"))?,
+            o_proj: linear_no_bias(config.num_attention_heads * head_dim, config.hidden_size, vb.pp("o_proj"))?,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim,
@@ -71,18 +55,21 @@ impl Attention {
         let k = self.rope.forward(&k, start_pos)?;
 
         let (k_full, v_full) = if let Some(cache) = cache {
-            let k_full = match &cache.k {
-                Some(prev) => Tensor::cat(&[prev, &k], 2)?,
-                None => k.clone(),
-            };
-            let v_full = match &cache.v {
-                Some(prev) => Tensor::cat(&[prev, &v], 2)?,
-                None => v.clone(),
-            };
             if update_cache {
                 cache.append(&k, &v)?;
+                (
+                    cache.k_view()?.expect("cache after append"),
+                    cache.v_view()?.expect("cache after append"),
+                )
+            } else {
+                match (cache.k_view()?, cache.v_view()?) {
+                    (Some(pk), Some(pv)) => (
+                        Tensor::cat(&[&pk, &k], 2)?,
+                        Tensor::cat(&[&pv, &v], 2)?,
+                    ),
+                    _ => (k, v),
+                }
             }
-            (k_full, v_full)
         } else {
             (k, v)
         };
@@ -96,8 +83,7 @@ impl Attention {
         let att = if s > 1 {
             let kv_len = k_full.dim(2)?;
             let mask = causal_mask(s, kv_len, q.device())?;
-            let att = att.broadcast_add(&mask)?;
-            candle_nn::ops::softmax_last_dim(&att)?
+            candle_nn::ops::softmax_last_dim(&att.broadcast_add(&mask)?)?
         } else {
             candle_nn::ops::softmax_last_dim(&att)?
         };
@@ -120,10 +106,8 @@ fn causal_mask(q_len: usize, kv_len: usize, device: &candle_core::Device) -> Can
     let mut mask = vec![0f32; q_len * kv_len];
     for i in 0..q_len {
         let max_key = kv_len - q_len + i;
-        for j in 0..kv_len {
-            if j > max_key {
-                mask[i * kv_len + j] = f32::NEG_INFINITY;
-            }
+        for j in (max_key + 1)..kv_len {
+            mask[i * kv_len + j] = f32::NEG_INFINITY;
         }
     }
     Tensor::from_vec(mask, (1, 1, q_len, kv_len), device)
