@@ -1,9 +1,10 @@
-//! Fertile ARM backend — aarch64 customer fallback.
+//! Fertile ARM/CPU backend — same DeviceGroupPlan path.
 
 use candle_core::{DType, Result as CandleResult, Tensor};
 use candle_nn::Module;
 
-use super::dispatch::{scatter_add, ExpertBuckets, FertileExpert, FertileMoeParams};
+use super::dispatch::{FertileExpert, FertileMoeParams};
+use super::group_plan::{device_scatter_add, DeviceGroupPlan};
 
 pub fn fertile_moe_arm<E: FertileExpert>(
     x_flat: &Tensor,
@@ -46,21 +47,20 @@ pub fn fertile_moe_arm<E: FertileExpert>(
         candle_nn::ops::softmax_last_dim(&topk_w)?
     };
 
-    let ids_v = topk_ids.flatten_all()?.to_vec1::<i64>()?;
-    let w_v = topk_w.flatten_all()?.to_dtype(DType::F32)?.to_vec1::<f32>()?;
-    let buckets = ExpertBuckets::from_topk(
-        &ids_v, &w_v, t, params.num_experts_per_tok, routed.len(), params.routed_scaling_factor,
-    );
+    let plan = DeviceGroupPlan::from_topk(
+        &topk_ids,
+        &topk_w,
+        routed.len(),
+        params.routed_scaling_factor,
+    )?;
 
     let mut routed_acc = Tensor::zeros((t, h), dtype, device)?;
-    for (e, (toks, ws)) in buckets.token_indices.into_iter().zip(buckets.weights).enumerate() {
-        if toks.is_empty() { continue; }
-        let n = toks.len();
-        let indices = Tensor::from_vec(toks, (n,), device)?;
-        let w = Tensor::from_vec(ws, (n, 1), device)?.to_dtype(dtype)?;
+    for e in 0..plan.n_experts {
+        let Some(indices) = plan.tokens_for(e)? else { continue };
+        let Some(w) = plan.weights_for(e, dtype)? else { continue };
         let selected = x_flat.index_select(&indices, 0)?;
         let y = routed[e].forward(&selected)?.broadcast_mul(&w)?;
-        routed_acc = scatter_add(&routed_acc, &indices, &y)?;
+        routed_acc = device_scatter_add(&routed_acc, &indices, &y)?;
     }
 
     out + routed_acc
