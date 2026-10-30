@@ -1,24 +1,12 @@
-//! Offline inference example
-//!
-//! Usage:
-//!   cargo run --example offline_infer -- --model /path/to/model.safetensors
-
-use clap::Parser;
-use loopmoe::{config::ModelConfig, engine::InferenceEngine};
-
-#[derive(Parser)]
-struct Args {
-    #[arg(long)]
-    model: String,
-}
+use loopmoe::{config::ModelConfig, engine::InferenceEngine, sampler::SamplingParams, tokenizer::Tokenizer};
 
 fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    let mut config = ModelConfig::default();
-    config.loop_count = 24;
-
-    let engine = InferenceEngine::from_safetensors(&args.model, config)?;
-    println!("Loaded on device: {:?}", engine.device);
-    println!("Effective depth: {}", engine.config.effective_depth());
+    let model = std::env::args().nth(1).expect("usage: offline_infer <weights_dir> [prompt]");
+    let prompt = std::env::args().nth(2).unwrap_or_else(|| "Hello".into());
+    let engine = InferenceEngine::from_safetensors(&model, ModelConfig::sentinel_v1())?;
+    let tok = Tokenizer::from_model_dir(&model).unwrap_or_else(|_| Tokenizer::byte_level());
+    let ids = tok.encode(&prompt)?;
+    let out = engine.generate(&ids, 32, &SamplingParams::greedy())?;
+    println!("{}", tok.decode(&out[ids.len()..])?);
     Ok(())
 }
