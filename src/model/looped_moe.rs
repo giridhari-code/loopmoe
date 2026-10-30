@@ -1,7 +1,7 @@
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::{Module, VarBuilder};
 use crate::config::ModelConfig;
-use crate::cache::LayerCaches;
+use crate::cache::RuntimeCaches;
 use super::{RmsNorm, TransformerBlock, rope::RotaryEmbedding};
 
 pub struct LoopedMoE {
@@ -17,72 +17,49 @@ impl LoopedMoE {
     pub fn load(vb: VarBuilder, config: &ModelConfig, device: &Device) -> CandleResult<Self> {
         let dtype = vb.dtype();
         let rope_len = config.max_seq_len.min(config.max_position_embeddings);
-
-        let embed_tokens = candle_nn::embedding(
-            config.vocab_size,
-            config.hidden_size,
-            vb.pp("model.embed_tokens"),
-        )?;
-
+        let rope_dim = if config.use_mla { config.qk_rope_head_dim } else { config.head_dim };
+        let embed_tokens = candle_nn::embedding(config.vocab_size, config.hidden_size, vb.pp("model.embed_tokens"))?;
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let layer_rope = RotaryEmbedding::new(
-                config.head_dim,
-                rope_len,
-                config.rope_theta,
-                device,
-                dtype,
-            )?;
-            layers.push(TransformerBlock::load(
-                vb.pp(&format!("model.layers.{i}")),
-                config,
-                layer_rope,
-            )?);
+            let layer_rope = RotaryEmbedding::new(rope_dim, rope_len, config.rope_theta, device, dtype)?;
+            layers.push(TransformerBlock::load(vb.pp(&format!("model.layers.{i}")), config, layer_rope)?);
         }
-
         let norm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
-
         let lm_head = if config.tie_word_embeddings {
             match candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head")) {
                 Ok(l) => l,
-                Err(_) => candle_nn::linear(
-                    config.hidden_size,
-                    config.vocab_size,
-                    vb.pp("model.embed_tokens"),
-                )?,
+                Err(_) => candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("model.embed_tokens"))?,
             }
         } else {
             candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
         };
-
-        Ok(Self {
-            config: config.clone(),
-            embed_tokens,
-            layers,
-            norm,
-            lm_head,
-            device: device.clone(),
-        })
+        Ok(Self { config: config.clone(), embed_tokens, layers, norm, lm_head, device: device.clone() })
     }
 
     pub fn forward(
-        &self,
-        input_ids: &Tensor,
-        start_pos: usize,
-        caches: Option<&mut LayerCaches>,
+        &self, input_ids: &Tensor, start_pos: usize, caches: Option<&mut RuntimeCaches>,
     ) -> CandleResult<Tensor> {
         let (_b, seq_len) = input_ids.dims2()?;
         let mut hidden = self.embed_tokens.forward(input_ids)?;
-
         let num_loops = self.config.loop_count;
         for loop_idx in 0..num_loops {
             let update_cache = loop_idx == num_loops - 1;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                let cache = caches.as_mut().map(|c| &mut c.layers[layer_idx]);
-                hidden = layer.forward(&hidden, start_pos, cache, update_cache)?;
+                match caches {
+                    Some(RuntimeCaches::Gqa(bank)) => {
+                        let cache = &mut bank.layers[layer_idx];
+                        hidden = layer.forward(&hidden, start_pos, Some(cache), None, update_cache)?;
+                    }
+                    Some(RuntimeCaches::Mla(bank)) => {
+                        let cache = &mut bank.layers[layer_idx];
+                        hidden = layer.forward(&hidden, start_pos, None, Some(cache), update_cache)?;
+                    }
+                    None => {
+                        hidden = layer.forward(&hidden, start_pos, None, None, false)?;
+                    }
+                }
             }
         }
-
         let hidden = self.norm.forward(&hidden)?;
         let hidden = if seq_len > 1 {
             hidden.narrow(1, seq_len - 1, 1)?.squeeze(1)?

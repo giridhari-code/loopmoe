@@ -1,8 +1,8 @@
 use candle_core::{Result as CandleResult, Tensor};
 use candle_nn::VarBuilder;
 use crate::config::ModelConfig;
-use crate::cache::KvCache;
-use super::{Attention, MoeLayer, rope::RotaryEmbedding};
+use crate::cache::{KvCache, MlaCache};
+use super::{Attention, MoeLayer, MlaAttention, rope::RotaryEmbedding};
 
 pub struct RmsNorm {
     weight: Tensor,
@@ -24,47 +24,53 @@ impl RmsNorm {
     }
 }
 
+pub enum SelfAttention {
+    Gqa(Attention),
+    Mla(MlaAttention),
+}
+
+impl SelfAttention {
+    pub fn forward(
+        &self, x: &Tensor, start_pos: usize,
+        gqa: Option<&mut KvCache>, mla: Option<&mut MlaCache>, update_cache: bool,
+    ) -> CandleResult<Tensor> {
+        match self {
+            SelfAttention::Gqa(a) => a.forward(x, start_pos, gqa, update_cache),
+            SelfAttention::Mla(a) => a.forward(x, start_pos, mla, update_cache),
+        }
+    }
+}
+
 pub struct TransformerBlock {
-    pub self_attn: Attention,
-    pub mlp: MoeLayer,
-    pub input_layernorm: RmsNorm,
-    pub post_attention_layernorm: RmsNorm,
+    input_layernorm: RmsNorm,
+    self_attn: SelfAttention,
+    post_attention_layernorm: RmsNorm,
+    mlp: MoeLayer,
 }
 
 impl TransformerBlock {
-    pub fn load(
-        vb: VarBuilder,
-        config: &ModelConfig,
-        rope: RotaryEmbedding,
-    ) -> CandleResult<Self> {
+    pub fn load(vb: VarBuilder, config: &ModelConfig, rope: RotaryEmbedding) -> CandleResult<Self> {
+        let self_attn = if config.use_mla {
+            SelfAttention::Mla(MlaAttention::load(vb.pp("self_attn"), config, rope)?)
+        } else {
+            SelfAttention::Gqa(Attention::load(vb.pp("self_attn"), config, rope)?)
+        };
         Ok(Self {
-            self_attn: Attention::load(vb.pp("self_attn"), config, rope)?,
+            input_layernorm: RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("input_layernorm"))?,
+            self_attn,
+            post_attention_layernorm: RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("post_attention_layernorm"))?,
             mlp: MoeLayer::load(vb.pp("mlp"), config)?,
-            input_layernorm: RmsNorm::load(
-                config.hidden_size,
-                config.rms_norm_eps,
-                vb.pp("input_layernorm"),
-            )?,
-            post_attention_layernorm: RmsNorm::load(
-                config.hidden_size,
-                config.rms_norm_eps,
-                vb.pp("post_attention_layernorm"),
-            )?,
         })
     }
 
     pub fn forward(
-        &self,
-        x: &Tensor,
-        start_pos: usize,
-        cache: Option<&mut KvCache>,
-        update_cache: bool,
+        &self, x: &Tensor, start_pos: usize,
+        gqa: Option<&mut KvCache>, mla: Option<&mut MlaCache>, update_cache: bool,
     ) -> CandleResult<Tensor> {
         let residual = x;
         let x = self.input_layernorm.forward(x)?;
-        let x = self.self_attn.forward(&x, start_pos, cache, update_cache)?;
+        let x = self.self_attn.forward(&x, start_pos, gqa, mla, update_cache)?;
         let x = (x + residual)?;
-
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
         let x = self.mlp.forward(&x)?;
