@@ -1,6 +1,6 @@
 use candle_core::{Device, Tensor, DType, D};
 use std::path::Path;
-use crate::{config::ModelConfig, model::LoopedMoE, cache::LayerCaches, Result};
+use crate::{config::ModelConfig, model::LoopedMoE, cache::LayerCaches, kernels::BackendInfo, Result};
 
 pub struct InferenceEngine {
     pub model: LoopedMoE,
@@ -15,6 +15,8 @@ impl InferenceEngine {
     ) -> Result<Self> {
         let device = select_device()?;
         tracing::info!("Using device: {:?}", device);
+        let backend = BackendInfo::from_device(&device);
+        tracing::info!(fertile_backend = %backend.kind, "Fertile kernel backend");
 
         let weights_path = model_path.as_ref();
         let vb = if weights_path.is_dir() {
@@ -39,22 +41,15 @@ impl InferenceEngine {
         Ok(Self { model, device, config })
     }
 
-    /// Prefill then decode with KV cache.
-    pub fn generate(
-        &self,
-        input_ids: &[u32],
-        max_new_tokens: usize,
-    ) -> Result<Vec<u32>> {
+    pub fn generate(&self, input_ids: &[u32], max_new_tokens: usize) -> Result<Vec<u32>> {
         let mut tokens = input_ids.to_vec();
         let mut caches = LayerCaches::new(self.config.num_layers);
 
-        // Prefill
         let prefill = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
         let logits = self.model.forward(&prefill, 0, Some(&mut caches))?;
         let mut next = logits.argmax(D::Minus1)?.to_scalar::<u32>()?;
         tokens.push(next);
 
-        // Decode
         for _ in 1..max_new_tokens {
             let start_pos = caches.current_len();
             let input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
@@ -75,6 +70,6 @@ fn select_device() -> Result<Device> {
     if let Ok(device) = Device::new_cuda(0) {
         return Ok(device);
     }
-    tracing::warn!("CUDA not available, falling back to CPU");
+    tracing::warn!("CUDA not available, falling back to CPU/ARM");
     Ok(Device::Cpu)
 }
