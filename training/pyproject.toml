@@ -1,0 +1,31 @@
+[project]
+name = "sentinel-train"
+version = "1.0.0"
+description = "Sentinel v1.0 training pipeline (pre / mid / post)"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.2",
+  "transformers>=4.40",
+  "datasets>=2.18",
+  "accelerate>=0.28",
+  "safetensors>=0.4",
+  "sentencepiece>=0.2",
+  "pyyaml>=6.0",
+  "tqdm>=4.66",
+  "numpy>=1.26",
+  "peft>=0.10",
+]
+
+[project.scripts]
+sentinel-pretrain = "sentinel_train.pretrain.train:main"
+sentinel-midtrain = "sentinel_train.midtrain.train:main"
+sentinel-sft = "sentinel_train.posttrain.sft:main"
+sentinel-dpo = "sentinel_train.posttrain.dpo:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sentinel_train*"]
