@@ -2,7 +2,7 @@
 name = "loopmoe"
 version = "1.0.0"
 edition = "2021"
-description = "Sentinel v1.0 — Looped MoE inference + Rust training"
+description = "Sentinel v1.0 — Looped MoE inference + recipe API + Rust training"
 license = "Apache-2.0"
 
 [dependencies]
@@ -20,12 +20,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 half = "2"
 tokenizers = { version = "0.20", default-features = false, features = ["onig"] }
+axum = { version = "0.7", optional = true }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"], optional = true }
+tower-http = { version = "0.5", features = ["cors"], optional = true }
 
 [features]
 default = ["cuda"]
 cuda = ["candle-core/cuda"]
 arm = []
 cpu = []
+server = ["dep:axum", "dep:tokio", "dep:tower-http"]
 
 [[bin]]
 name = "sentinel"
@@ -39,6 +43,15 @@ path = "src/main.rs"
 name = "sentinel-train"
 path = "src/bin/sentinel_train.rs"
 
+[[bin]]
+name = "sentinel-server"
+path = "src/bin/sentinel_server.rs"
+required-features = ["server"]
+
 [[example]]
 name = "offline_infer"
 path = "examples/offline_infer.rs"
+
+[[example]]
+name = "recipe_chat"
+path = "examples/recipe_chat.rs"
