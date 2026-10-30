@@ -1,8 +1,8 @@
 [package]
 name = "loopmoe"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "High-performance MoE + Looped Transformer inference — Fertile kernel"
+description = "Sentinel v1.0 — Looped MoE inference with Fertile kernel"
 license = "Apache-2.0"
 
 [dependencies]
@@ -25,6 +25,10 @@ default = ["cuda"]
 cuda = ["candle-core/cuda"]
 arm = []
 cpu = []
+
+[[bin]]
+name = "sentinel"
+path = "src/main.rs"
 
 [[bin]]
 name = "loopmoe"

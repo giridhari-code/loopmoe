@@ -1,26 +1,19 @@
-# LoopMoE
+# Sentinel v1.0
 
-Looped Transformer + Shared/Routed MoE. Kernel: **Fertile**.
+Looped Transformer + Shared/Routed MoE inference.
 
-## RAM optimizations
+| | |
+|--|--|
+| **Model** | `Sentinel-v1.0` |
+| **Kernel** | Fertile (CUDA → ARM → CPU) |
+| **Loop count** | 24 |
+| **MoE** | DeepInfer-style routed + shared experts |
 
-| Area | What |
-|------|------|
-| **KV cache** | Preallocated capacity (`max_seq_len`); no O(n²) `cat` growth |
-| **RoPE** | Sin/cos table sized to `max_seq_len` (default **4096**), not 128k |
-| **Prefill logits** | Only last-token → lm_head |
-| **Decode mask** | No causal mask when `seq==1` |
-| **Weights** | mmap safetensors + BF16 |
-| **MoE** | Device-side group plan; one run per expert |
-
-```rust
-max_seq_len: 4096  // raise only if you need longer context
-```
-
-## Backends
-
-CUDA → ARM (aarch64) → CPU
+Not a DeepSeek-V4.1 clone — MoE **config/weight naming** follows DeepInfer HF conventions; architecture is Sentinel (looped stack).
 
 ```bash
-cargo build --release
+cargo run --release --bin sentinel -- --model /path/to/weights.safetensors
+cargo run --release --bin sentinel -- --model ./weights --config configs/sentinel-v1.0.json
 ```
+
+Shared experts: `mlp.shared_experts.{i}` or `mlp.experts.{n_routed+i}`.

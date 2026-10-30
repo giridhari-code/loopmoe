@@ -1,7 +1,12 @@
 use serde::{Deserialize, Serialize};
 
+/// **Sentinel v1.0** model configuration.
+/// MoE fields follow DeepInfer / DeepSeek HF conventions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelConfig {
+    pub model_name: String,
+    pub model_type: String,
+
     pub vocab_size: usize,
     pub hidden_size: usize,
     pub intermediate_size: usize,
@@ -22,11 +27,11 @@ pub struct ModelConfig {
     pub topk_method: String,
 
     pub max_position_embeddings: usize,
-    /// RoPE + KV prealloc budget (keep modest for RAM)
     pub max_seq_len: usize,
     pub rope_theta: f32,
 
     pub rms_norm_eps: f32,
+    pub hidden_act: String,
 
     pub tie_word_embeddings: bool,
     pub use_sliding_window: bool,
@@ -36,6 +41,9 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            model_name: "Sentinel-v1.0".to_string(),
+            model_type: "sentinel_looped_moe".to_string(),
+
             vocab_size: 128_256,
             hidden_size: 4096,
             intermediate_size: 11008,
@@ -60,6 +68,8 @@ impl Default for ModelConfig {
             rope_theta: 500_000.0,
 
             rms_norm_eps: 1e-5,
+            hidden_act: "silu".to_string(),
+
             tie_word_embeddings: false,
             use_sliding_window: false,
             sliding_window: None,
@@ -68,6 +78,8 @@ impl Default for ModelConfig {
 }
 
 impl ModelConfig {
+    pub const MODEL_ID: &'static str = "Sentinel-v1.0";
+
     pub fn effective_depth(&self) -> usize {
         self.num_layers * self.loop_count
     }
@@ -78,6 +90,14 @@ impl ModelConfig {
 
     pub fn from_json(path: &str) -> anyhow::Result<Self> {
         let data = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&data)?)
+        let mut cfg: Self = serde_json::from_str(&data)?;
+        if cfg.model_name.is_empty() {
+            cfg.model_name = Self::MODEL_ID.to_string();
+        }
+        Ok(cfg)
+    }
+
+    pub fn sentinel_v1() -> Self {
+        Self::default()
     }
 }

@@ -9,3 +9,6 @@ pub use layers::*;
 pub use moe::*;
 pub use looped_moe::LoopedMoE;
 pub use rope::RotaryEmbedding;
+
+/// **Sentinel v1.0** — primary model type.
+pub type SentinelV1 = LoopedMoE;

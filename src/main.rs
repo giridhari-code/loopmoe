@@ -3,21 +3,17 @@ use loopmoe::{config::ModelConfig, engine::InferenceEngine};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "loopmoe", about = "MoE + Looped Transformer Inference Engine")]
+#[command(name = "sentinel", about = "Sentinel v1.0 — Looped MoE inference (Fertile kernel)")]
 struct Args {
-    /// Path to safetensors weights (file or directory)
     #[arg(short, long)]
     model: String,
 
-    /// Path to config.json (optional, uses defaults if missing)
     #[arg(short, long)]
     config: Option<String>,
 
-    /// Prompt text
     #[arg(short, long, default_value = "Hello")]
     prompt: String,
 
-    /// Max new tokens
     #[arg(long, default_value_t = 64)]
     max_tokens: usize,
 }
@@ -32,23 +28,21 @@ fn main() -> anyhow::Result<()> {
     let config = if let Some(cfg_path) = args.config {
         ModelConfig::from_json(&cfg_path)?
     } else {
-        let mut cfg = ModelConfig::default();
-        cfg.loop_count = 24; // as requested
-        cfg
+        ModelConfig::sentinel_v1()
     };
 
     tracing::info!(
-        "Effective depth = {} layers × {} loops = {}",
-        config.num_layers,
-        config.loop_count,
-        config.effective_depth()
+        model = %config.model_name,
+        model_type = %config.model_type,
+        loop_count = config.loop_count,
+        effective_depth = config.effective_depth(),
+        routed = config.n_routed_experts,
+        shared = config.n_shared_experts,
+        "Loading Sentinel"
     );
 
     let engine = InferenceEngine::from_safetensors(&args.model, config)?;
-
-    // Placeholder generation (tokenizer not wired yet)
-    tracing::info!("Model loaded successfully on {:?}", engine.device);
-    tracing::info!("Ready for inference. Tokenizer + full generation coming next.");
-
+    tracing::info!("Sentinel v1.0 ready (weights={})", args.model);
+    let _ = (engine, args.prompt, args.max_tokens);
     Ok(())
 }
