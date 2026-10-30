@@ -12,10 +12,11 @@
 - [x] Project structure
 - [x] ModelConfig (loop_count = 24)
 - [x] LoopedMoE forward skeleton
-- [x] MoE layer placeholder
+- [x] MoE layer (top-k routing)
 - [x] Device selection (CUDA → CPU)
 - [x] Safetensors loading via candle
-- [ ] Proper top-k MoE routing + efficient kernels
+- [x] Proper top-k MoE routing (Phase 1)
+- [ ] Efficient grouped GEMM / DeepEP-style kernels
 - [ ] RoPE + KV cache
 - [ ] Continuous batching / PagedAttention
 - [ ] Tokenizer integration
