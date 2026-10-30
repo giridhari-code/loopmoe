@@ -1,20 +1,13 @@
 use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::{Module, VarBuilder};
 use crate::config::ModelConfig;
-use super::{Attention, MoeLayer, RmsNorm, TransformerBlock};
+use crate::cache::LayerCaches;
+use super::{RmsNorm, TransformerBlock, rope::RotaryEmbedding};
 
-/// Looped MoE model.
-///
-/// Architecture:
-/// - Embedding
-/// - Shared TransformerBlock (contains Attention + MoE) applied `loop_count` times
-/// - Final RMSNorm + LM head
-///
-/// This is the core of weight-tied recurrent depth + sparse MoE.
 pub struct LoopedMoE {
     pub config: ModelConfig,
     pub embed_tokens: candle_nn::Embedding,
-    pub layers: Vec<TransformerBlock>,   // physical layers (shared across loops)
+    pub layers: Vec<TransformerBlock>,
     pub norm: RmsNorm,
     pub lm_head: candle_nn::Linear,
     pub device: Device,
@@ -22,6 +15,8 @@ pub struct LoopedMoE {
 
 impl LoopedMoE {
     pub fn load(vb: VarBuilder, config: &ModelConfig, device: &Device) -> CandleResult<Self> {
+        let dtype = vb.dtype();
+
         let embed_tokens = candle_nn::embedding(
             config.vocab_size,
             config.hidden_size,
@@ -30,21 +25,22 @@ impl LoopedMoE {
 
         let mut layers = Vec::with_capacity(config.num_layers);
         for i in 0..config.num_layers {
-            let layer = TransformerBlock::load(
+            let layer_rope = RotaryEmbedding::new(
+                config.head_dim,
+                config.max_position_embeddings,
+                config.rope_theta,
+                device,
+                dtype,
+            )?;
+            layers.push(TransformerBlock::load(
                 vb.pp(&format!("model.layers.{i}")),
                 config,
-            )?;
-            layers.push(layer);
+                layer_rope,
+            )?);
         }
 
         let norm = RmsNorm::load(config.hidden_size, config.rms_norm_eps, vb.pp("model.norm"))?;
-        
-        let lm_head = if config.tie_word_embeddings {
-            // weight tying – will use embed_tokens weights later
-            candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
-        } else {
-            candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
-        };
+        let lm_head = candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?;
 
         Ok(Self {
             config: config.clone(),
@@ -56,29 +52,31 @@ impl LoopedMoE {
         })
     }
 
-    /// Forward pass with looping.
-    /// For each of the `loop_count` iterations we run all physical layers.
-    pub fn forward(&self, input_ids: &Tensor, start_pos: usize) -> CandleResult<Tensor> {
-        let (_b_sz, seq_len) = input_ids.dims2()?;
+    /// Cache updated only on the last loop iteration (one KV stream per physical layer).
+    pub fn forward(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        caches: Option<&mut LayerCaches>,
+    ) -> CandleResult<Tensor> {
+        let (_b, seq_len) = input_ids.dims2()?;
         let mut hidden = self.embed_tokens.forward(input_ids)?;
 
-        // === Looped application of the shared stack ===
-        for _loop_idx in 0..self.config.loop_count {
-            for layer in &self.layers {
-                hidden = layer.forward(&hidden, start_pos)?;
+        let num_loops = self.config.loop_count;
+        for loop_idx in 0..num_loops {
+            let update_cache = loop_idx == num_loops - 1;
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let cache = caches.as_mut().map(|c| &mut c.layers[layer_idx]);
+                hidden = layer.forward(&hidden, start_pos, cache, update_cache)?;
             }
         }
 
         let hidden = self.norm.forward(&hidden)?;
-        
-        // Only last token for generation (common optimization)
         let hidden = if seq_len > 1 {
             hidden.i((.., seq_len - 1, ..))?
         } else {
-            hidden
+            hidden.squeeze(1)?
         };
-
-        let logits = self.lm_head.forward(&hidden)?;
-        Ok(logits)
+        self.lm_head.forward(&hidden)
     }
 }
