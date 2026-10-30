@@ -14,5 +14,7 @@ pub use engine::InferenceEngine;
 pub use model::{LoopedMoE, SentinelV1};
 pub use cache::{KvCache, LayerCaches};
 pub use kernels::{BackendKind, KERNEL_NAME};
+pub use sampler::SamplingParams;
+pub use tokenizer::Tokenizer;
 
 pub type Result<T> = anyhow::Result<T>;

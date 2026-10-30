@@ -1,13 +1,21 @@
 # Sentinel v1.0
 
-Looped MoE + Fertile inference. **Training is pure Rust** (`sentinel-train`).
+Looped MoE + Fertile inference. Training: pure Rust (`sentinel-train`).
+
+## Inference
 
 ```bash
-# inference
-cargo run --release --bin sentinel -- --model ./weights
-
-# training
-cargo run --release --bin sentinel-train -- --config configs/train_pretrain.json
+cargo run --release --bin sentinel -- \
+  --model /path/to/weights \
+  --prompt "Hello" \
+  --max-tokens 64 \
+  --temperature 0.7 \
+  --top-p 0.9 \
+  --top-k 50
 ```
 
-See [TRAINING.md](TRAINING.md). Python pipeline removed.
+Tokenizer, sampling (greedy/temp/top-k/top-p), stop tokens, seed — included.
+
+## Training
+
+See [TRAINING.md](TRAINING.md).
