@@ -16,7 +16,8 @@
 - [x] Safetensors loading via candle
 - [x] Top-k MoE routing
 - [x] **Shared + Routed experts** (DeepSeek style)
-- [ ] Efficient grouped GEMM / DeepEP-style kernels
+- [x] **Fused MoE kernel path** (expert-wise group, 1 run/expert)
+- [ ] Efficient grouped GEMM / DeepEP-style CUDA kernels
 - [ ] RoPE + KV cache
 - [ ] Continuous batching / PagedAttention
 - [ ] Tokenizer integration
@@ -37,20 +38,22 @@ output = shared_experts(x) + routed_scaling_factor * Σ (w_k * routed_expert_k(x
 | `routed_scaling_factor` | 1.0 | Scale on routed path |
 | `scoring_func` | softmax | or `sigmoid` |
 | `norm_topk_prob` | true | Renormalize top-k weights |
-| `topk_method` | greedy | Phase-1 |
 
-Checkpoint layout expected:
+**Fused kernel path** (`MoeLayer::forward`):
+1. Shared experts — one pass
+2. Router + top-k
+3. Group all tokens by expert (single pass)
+4. Each routed expert runs **exactly once**
+5. Scaled scatter-add + combine
+
+Checkpoint layout:
 - `experts.0 .. experts.{n_routed-1}` → routed
 - `experts.{n_routed} ..` → shared
 
 ## Build
 
 ```bash
-# CUDA (default)
 cargo build --release
-
-# CPU only
-cargo build --release --no-default-features
 ```
 
 ## Run
@@ -58,9 +61,3 @@ cargo build --release --no-default-features
 ```bash
 cargo run --release -- --model /path/to/model.safetensors
 ```
-
-## Design Notes
-
-- Physical layers (`num_layers`) are weight-tied and applied `loop_count` times.
-- Effective depth = `num_layers * loop_count` (default 8 × 24 = 192).
-- Future kernels will take inspiration from DeepInfer (DeepEP / DeepGEMM style dispatch).
