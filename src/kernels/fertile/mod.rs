@@ -11,7 +11,7 @@
 
 mod dispatch;
 
-pub use dispatch::{FertileDispatch, FertileMoeParams, fertile_moe};
+pub use dispatch::{FertileDispatch, FertileExpert, FertileMoeParams, fertile_moe};
 
 /// Kernel identity for logs / profiling.
 pub const KERNEL_NAME: &str = "Fertile";
