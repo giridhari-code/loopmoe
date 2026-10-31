@@ -1,6 +1,6 @@
 # Orbit architecture
 
-Orbit is **loopmoe’s native** continuous-batch inference runtime.
+Native continuous-batch runtime for LoopedMoE + Tesla (no external serving engine).
 
 ## Phases
 
@@ -8,26 +8,38 @@ Orbit is **loopmoe’s native** continuous-batch inference runtime.
 |-------|--------|
 | O1 BlockLedger | Done |
 | O2 / O2.1 PackedBatch B>1 | Done |
-| O3 Tesla-in-schedule + chunked prefill | Done |
-| **O4 Frontier server** | **Done** |
-| O5 Prefix hash + EP | Planned |
+| O3 Tesla + chunked prefill | Done |
+| O4 Frontier HTTP | Done |
+| **O5 Prefix hash + EP packing** | **Done** |
 
-## O4 Frontier
+## O5 Prefix cache
 
-OpenAI-compatible HTTP API on top of `InferenceEngine` (+ optional Tesla).
-
-```bash
-cargo run --release --bin sentinel-server --features server -- \
-  --model ./weights --port 8080 --tesla --tesla-k 5
+```rust
+ledger.allocate_with_prefix(seq_id, &prompt_tokens); // hits shared pages
+// ... run prefill for unique pages only (engine still fills KV) ...
+ledger.seal_seq_prompt(seq_id, &prompt_tokens);
 ```
 
-| Route | Method |
-|-------|--------|
-| `/health` | GET |
-| `/v1/models` | GET |
-| `/v1/chat/completions` | POST (JSON or `stream: true` SSE) |
-| `/v1/completions` | POST |
+- FNV-1a chained hashes per page (`hash_token_block` / `hash_prompt_pages`)
+- `prefix_index: HashMap<hash, page_id>` + refcount
+- Stats: `ledger.stats.prefix.{hits,misses,pages_shared,pages_sealed}`
 
-Module: `src/frontier/` · binary: `sentinel-server`.
+## O5 Expert Parallel
 
-Generate path today: mutex + `generate` / `generate_tesla`. Continuous `BatchEngine` worker can replace `generate()` later without changing routes.
+```rust
+let (packed, meta) = pack_by_ep_rank(&tokens, &topk_ids, n_routed, ep_size)?;
+// local experts on each rank's slice...
+let out = unpack_combine(&expert_out, &CombineMeta::from_dispatch(&meta))?;
+```
+
+- `expert_to_rank` matches `ExpertParallelPlan` contiguous shards
+- `AllToAllStub::dispatch` packs when `ep_size > 1` and top-k provided
+- **NCCL/DeepEP device transfer** still not linked (same-process logical EP)
+
+## Layout
+
+```
+src/orbit/prefix.rs   # hash helpers
+src/orbit/ledger.rs   # allocate_with_prefix / seal
+src/parallel/collectives.rs  # pack_by_ep_rank / unpack
+```

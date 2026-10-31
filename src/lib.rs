@@ -1,7 +1,4 @@
-//! loopmoe / Sentinel — high-performance Looped-MoE inference runtime
-//!
-//! **Orbit**: O1 BlockLedger · O2/O2.1 PackedBatch · O3 chunked prefill + Tesla schedule ·
-//! **O4 Frontier** OpenAI HTTP API.
+//! loopmoe / Sentinel — Orbit O1–O5 inference runtime
 
 pub mod config;
 pub mod error;
@@ -43,15 +40,15 @@ pub use recipe::{
 pub use tesla::{MtpState, TeslaConfig};
 pub use parallel::{
     ParallelConfig, ParallelismKind, DeviceMesh, RankInfo, ExpertParallelPlan, ExpertShard,
-    AllToAllStub, DispatchMeta, CombineMeta,
+    AllToAllStub, DispatchMeta, CombineMeta, pack_by_ep_rank, unpack_combine, expert_to_rank,
 };
 pub use scheduler::{
     ContinuousScheduler, PrefillChunk, SchedulerConfig, SchedulerOutputs, Sequence, SequenceStatus,
 };
 pub use orbit::{
-    BlockLedger, CacheKind, LedgerConfig, LedgerStats, OrbitCore, OrbitMetrics, OrbitSched,
-    PackItem, PackResolve, PackRole, PackedBatch, Pulse, PulseMetrics, PulseOutput, SeqBlockTable,
-    SlotMapping,
+    hash_prompt_pages, hash_token_block, BlockLedger, CacheKind, LedgerConfig, LedgerStats,
+    OrbitCore, OrbitMetrics, OrbitSched, PackItem, PackResolve, PackRole, PackedBatch, PrefixStats,
+    Pulse, PulseMetrics, PulseOutput, SeqBlockTable, SlotMapping,
 };
 
 #[cfg(feature = "server")]
