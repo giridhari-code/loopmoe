@@ -1,10 +1,4 @@
 //! BatchEngine — continuous scheduler + InferenceEngine step loop (optimized).
-//!
-//! Flow:
-//! 1. `add_request` → waiting queue
-//! 2. `schedule()` → prefill_ids + decode_ids
-//! 3. run prefills, then decodes (plain or Tesla MTP)
-//! 4. reap finished → `results`
 
 use std::collections::HashMap;
 
@@ -145,20 +139,14 @@ impl BatchEngine {
         self.scheduler.has_unfinished()
     }
 
-    /// One optimized schedule + execute step.
     pub fn step(&mut self) -> Result<Vec<u64>> {
         self.metrics.steps += 1;
         let outputs = self.scheduler.schedule();
-
-        // Track preempts from scheduler
         self.metrics.preempted += outputs.preempted.len() as u64;
 
-        // Snapshot prefill / decode lists (owned)
         let prefill_ids = outputs.prefill_ids;
         let decode_ids = outputs.decode_ids;
-        let mut finished_ids = outputs.finished;
 
-        // ── Prefills first ────────────────────────────────────────────────
         for &id in &prefill_ids {
             if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
                 continue;
@@ -167,13 +155,11 @@ impl BatchEngine {
             self.metrics.prefills += 1;
         }
 
-        // ── Decodes ──────────────────────────────────────────────────────
         let use_tesla = self.tesla.as_ref().map(|t| t.enabled).unwrap_or(false);
         for &id in &decode_ids {
             if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
                 continue;
             }
-            // Skip if still needs prefill (shouldn't happen with split schedule)
             if self.scheduler.get(id).map(|s| s.is_prompt()).unwrap_or(false) {
                 self.run_prefill(id)?;
                 self.metrics.prefills += 1;
@@ -188,28 +174,42 @@ impl BatchEngine {
             self.metrics.decodes += 1;
         }
 
-        // ── Reap anything finished this step ──────────────────────────────
-        for id in self.scheduler.running_ids() {
-            if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(false) {
-                finished_ids.push(id);
+        // Move any seqs that finished during this step into finished_buf
+        let newly_done: Vec<u64> = self
+            .scheduler
+            .running_ids()
+            .into_iter()
+            .filter(|&id| {
+                self.scheduler
+                    .get(id)
+                    .map(|s| s.is_finished())
+                    .unwrap_or(false)
+            })
+            .collect();
+        for id in newly_done {
+            if let Some(pos) = self
+                .scheduler
+                .running_ids()
+                .iter()
+                .position(|_| true)
+            {
+                let _ = pos;
+            }
+            // Use finish_sequence to move into finished_buf (status already set)
+            if let Some(seq) = self.scheduler.get(id) {
+                let status = seq.status;
+                self.scheduler.finish_sequence(id, status);
             }
         }
-        // Also preempted already in finished_ids
-        finished_ids.sort_unstable();
-        finished_ids.dedup();
 
-        let mut done = Vec::with_capacity(finished_ids.len());
-        for id in finished_ids {
-            // Preempted may already be removed — take_finished handles missing
-            if let Some(seq) = self.scheduler.take_finished(id) {
-                self.results.insert(id, seq.tokens);
-                self.runtimes.remove(&id);
-                self.metrics.finished += 1;
-                done.push(id);
-            } else if let Some(tokens) = self.results.get(&id) {
-                let _ = tokens;
-                done.push(id);
-            }
+        // Drain finished_buf → results
+        let mut done = Vec::new();
+        for seq in self.scheduler.drain_finished() {
+            let id = seq.id;
+            self.results.insert(id, seq.tokens);
+            self.runtimes.remove(&id);
+            self.metrics.finished += 1;
+            done.push(id);
         }
         Ok(done)
     }
@@ -217,6 +217,11 @@ impl BatchEngine {
     pub fn run_all(&mut self) -> Result<HashMap<u64, Vec<u32>>> {
         while self.has_unfinished() {
             let _ = self.step()?;
+        }
+        // Final drain in case anything left in buf
+        for seq in self.scheduler.drain_finished() {
+            self.results.insert(seq.id, seq.tokens);
+            self.runtimes.remove(&seq.id);
         }
         tracing::info!(
             steps = self.metrics.steps,
@@ -319,7 +324,6 @@ impl BatchEngine {
     }
 
     fn run_decode_tesla(&mut self, id: u64) -> Result<()> {
-        // Borrow tesla config without cloning whole engine
         let cfg = self
             .tesla
             .as_ref()
@@ -378,16 +382,6 @@ impl BatchEngine {
 
         rt.mtp
             .on_verify_result(stats.accepted, stats.scheduled, &cfg);
-
-        tracing::debug!(
-            seq = id,
-            drafted = stats.drafted,
-            scheduled = stats.scheduled,
-            accepted = stats.accepted,
-            accept_rate = rt.mtp.accept_rate,
-            forwards = stats.forwards,
-            "Tesla MTP step"
-        );
 
         for &t in &accepted {
             rt.generated.push(t);

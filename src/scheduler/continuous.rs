@@ -46,6 +46,8 @@ pub struct ContinuousScheduler {
     block_manager: BlockManager,
     waiting: Vec<Sequence>,
     running: Vec<Sequence>,
+    /// Reaped this / previous schedule — still hold tokens for BatchEngine.
+    finished_buf: Vec<Sequence>,
     next_id: u64,
     pub stats: SchedulerStats,
 }
@@ -66,6 +68,7 @@ impl ContinuousScheduler {
             block_manager: BlockManager::new(num_gpu_blocks, block_size),
             waiting: Vec::new(),
             running: Vec::new(),
+            finished_buf: Vec::new(),
             next_id: 1,
             stats: SchedulerStats::default(),
         }
@@ -123,12 +126,13 @@ impl ContinuousScheduler {
         self.stats.schedule_calls += 1;
         let mut out = SchedulerOutputs::default();
 
-        // ── 1. Reap finished ──────────────────────────────────────────────
+        // ── 1. Reap finished → finished_buf (keep tokens) ─────────────────
         let mut still = Vec::with_capacity(self.running.len());
         for seq in self.running.drain(..) {
             if seq.is_finished() {
                 out.finished.push(seq.id);
                 self.block_manager.free_many(&seq.block_table);
+                self.finished_buf.push(seq);
                 self.stats.total_finished += 1;
             } else {
                 still.push(seq);
@@ -140,10 +144,8 @@ impl ContinuousScheduler {
         let max_tok = self.cfg.max_num_batched_tokens;
         let mut num_tokens = 0usize;
 
-        // ── 2. Phase A: decide which running seqs decode, collect block needs ─
-        // Avoid mut borrow of running while preempting.
+        // ── 2. Decode candidates (no live mut borrow across preempt) ──────
         let mut decode_candidates: Vec<(u64, usize, usize)> = Vec::new();
-        // (id, est_tokens, extra_blocks_needed)
         for seq in &self.running {
             if seq.is_prompt() {
                 continue;
@@ -176,7 +178,6 @@ impl ContinuousScheduler {
                         }
                     }
                     AllocStatus::Later if self.cfg.enable_preempt => {
-                        // Preempt someone else, then retry allocate
                         if !self.preempt_one_except(id, &mut out) {
                             continue;
                         }
@@ -197,7 +198,7 @@ impl ContinuousScheduler {
         }
         out.decode_ids = selected_decode;
 
-        // ── 3. Admit prefills (shortest-first) ────────────────────────────
+        // ── 3. Admit prefills ─────────────────────────────────────────────
         if self.cfg.shortest_first && self.waiting.len() > 1 {
             self.waiting.sort_by_key(|s| s.prompt_len);
         }
@@ -252,6 +253,7 @@ impl ContinuousScheduler {
                 AllocStatus::Never => {
                     seq.finish(SequenceStatus::FinishedIgnored);
                     out.finished.push(seq.id);
+                    self.finished_buf.push(seq);
                     self.stats.total_finished += 1;
                 }
                 _ => waiting_keep.push(seq),
@@ -268,7 +270,6 @@ impl ContinuousScheduler {
         self.preempt_one_except(u64::MAX, out)
     }
 
-    /// Preempt longest running seq (not `except_id`). Safe: no live iterators.
     fn preempt_one_except(&mut self, except_id: u64, out: &mut SchedulerOutputs) -> bool {
         let mut best: Option<(usize, usize)> = None;
         for (i, seq) in self.running.iter().enumerate() {
@@ -289,6 +290,7 @@ impl ContinuousScheduler {
         self.block_manager.free_many(&seq.block_table);
         out.preempted.push(seq.id);
         out.finished.push(seq.id);
+        self.finished_buf.push(seq);
         self.stats.total_preempts += 1;
         self.stats.total_finished += 1;
         true
@@ -308,10 +310,20 @@ impl ContinuousScheduler {
             .find(|s| s.id == id)
     }
 
+    /// Drain all reaped finished sequences (tokens intact).
+    pub fn drain_finished(&mut self) -> Vec<Sequence> {
+        std::mem::take(&mut self.finished_buf)
+    }
+
     pub fn take_finished(&mut self, id: u64) -> Option<Sequence> {
+        if let Some(pos) = self.finished_buf.iter().position(|s| s.id == id) {
+            return Some(self.finished_buf.swap_remove(pos));
+        }
         if let Some(pos) = self.running.iter().position(|s| s.id == id) {
             let seq = self.running.swap_remove(pos);
-            self.block_manager.free_many(&seq.block_table);
+            if seq.is_finished() {
+                self.block_manager.free_many(&seq.block_table);
+            }
             return Some(seq);
         }
         if let Some(pos) = self.waiting.iter().position(|s| s.id == id) {
@@ -325,9 +337,11 @@ impl ContinuousScheduler {
             let mut seq = self.running.swap_remove(pos);
             seq.finish(status);
             self.block_manager.free_many(&seq.block_table);
+            self.finished_buf.push(seq);
         } else if let Some(pos) = self.waiting.iter().position(|s| s.id == id) {
             let mut seq = self.waiting.swap_remove(pos);
             seq.finish(status);
+            self.finished_buf.push(seq);
         }
     }
 
@@ -338,6 +352,7 @@ impl ContinuousScheduler {
             if seq.request_id == request_id && !seq.is_finished() {
                 seq.finish(SequenceStatus::FinishedAborted);
                 self.block_manager.free_many(&seq.block_table);
+                self.finished_buf.push(seq);
                 n += 1;
             } else {
                 still_running.push(seq);
@@ -349,6 +364,7 @@ impl ContinuousScheduler {
         for mut seq in self.waiting.drain(..) {
             if seq.request_id == request_id && !seq.is_finished() {
                 seq.finish(SequenceStatus::FinishedAborted);
+                self.finished_buf.push(seq);
                 n += 1;
             } else {
                 still_waiting.push(seq);
