@@ -1,34 +1,31 @@
-//! **Sentinel v1.0** — Fertile + Tesla (DSpark) + DoBu + parallel + recipe + training.
+//! loopmoe / miniinfer — high-performance inference runtime
+//!
+//! Professional modular layout:
+//! - `server`      OpenAI-compatible HTTP + SSE
+//! - `scheduler`   continuous batching + paged KV
+//! - `engine`      forward pass, sampling, metrics
+//! - `model`       architectures (Llama, Qwen, Looped-MoE)
+//! - `kernels`     CUDA / CPU kernels
+//! - `utils`       tokenizer, logging
 
 pub mod config;
+pub mod error;
+
+pub mod server;
+pub mod scheduler;
+pub mod engine;
 pub mod model;
 pub mod kernels;
+pub mod utils;
+
+// Existing specialized modules (kept for compatibility during migration)
 pub mod cache;
-pub mod engine;
-pub mod sampler;
-pub mod tokenizer;
-pub mod train;
+pub mod parallel;
 pub mod recipe;
 pub mod tesla;
-pub mod parallel;
+pub mod train;
+pub mod sampler;
+pub mod tokenizer;
 
-pub use config::ModelConfig;
-pub use engine::InferenceEngine;
-pub use model::{LoopedMoE, SentinelV1};
-pub use cache::{
-    KvCache, LayerCaches, MlaCache, MlaCaches, RuntimeCaches, kv_bytes_estimate, mla_bytes_estimate,
-};
-pub use kernels::{BackendKind, KERNEL_NAME};
-pub use sampler::SamplingParams;
-pub use tokenizer::Tokenizer;
-pub use recipe::{
-    ChatCompletionRequest, ChatCompletionResponse, Conversation, Message, RecipePipeline, Role,
-    SentinelEncoding,
-};
-pub use tesla::TeslaConfig;
-pub use parallel::{
-    ParallelConfig, ParallelismKind, DeviceMesh, RankInfo, ExpertParallelPlan, ExpertShard,
-    AllToAllStub, DispatchMeta, CombineMeta,
-};
-
-pub type Result<T> = anyhow::Result<T>;
+pub use config::{ModelConfig, ServerConfig};
+pub use error::Error;
