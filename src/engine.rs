@@ -3,7 +3,9 @@ use std::path::Path;
 use crate::{
     config::ModelConfig,
     model::LoopedMoE,
-    cache::{kv_bytes_estimate, LayerCaches, MlaCaches, RuntimeCaches},
+    cache::{
+        kv_bytes_estimate, mla_bytes_estimate, LayerCaches, MlaCaches, RuntimeCaches,
+    },
     kernels::BackendInfo,
     sampler::{sample_token, is_stop, SamplingParams},
     tesla::{
@@ -91,19 +93,36 @@ impl InferenceEngine {
             "Expert parallel plan"
         );
 
-        let kv_est = kv_bytes_estimate(
-            config.num_layers,
-            1,
-            config.num_key_value_heads,
-            config.head_dim,
-            config.max_seq_len,
-            2,
-        );
-        tracing::info!(
-            max_seq = config.max_seq_len,
-            kv_cache_mib = kv_est / (1024 * 1024),
-            "RAM plan"
-        );
+        if config.use_mla {
+            let mla_est = mla_bytes_estimate(
+                config.num_layers,
+                1,
+                config.kv_lora_rank,
+                config.qk_rope_head_dim,
+                config.max_seq_len,
+                2, // BF16
+            );
+            tracing::info!(
+                max_seq = config.max_seq_len,
+                mla_cache_mib = mla_est / (1024 * 1024),
+                rank = config.kv_lora_rank,
+                "MLA RAM plan (prealloc)"
+            );
+        } else {
+            let kv_est = kv_bytes_estimate(
+                config.num_layers,
+                1,
+                config.num_key_value_heads,
+                config.head_dim,
+                config.max_seq_len,
+                2,
+            );
+            tracing::info!(
+                max_seq = config.max_seq_len,
+                kv_cache_mib = kv_est / (1024 * 1024),
+                "GQA RAM plan (prealloc)"
+            );
+        }
 
         Ok(Self {
             model,
@@ -151,8 +170,17 @@ impl InferenceEngine {
         let capacity = (prompt_len + max_new_tokens)
             .min(self.config.max_seq_len)
             .max(prompt_len + 1);
+
         let mut caches = if self.config.use_mla {
-            RuntimeCaches::Mla(MlaCaches::new(self.config.num_layers))
+            RuntimeCaches::Mla(MlaCaches::with_capacity(
+                self.config.num_layers,
+                1,
+                self.config.kv_lora_rank,
+                self.config.qk_rope_head_dim,
+                capacity,
+                self.dtype,
+                &self.device,
+            ))
         } else {
             RuntimeCaches::Gqa(LayerCaches::with_capacity(
                 self.config.num_layers,
@@ -164,6 +192,7 @@ impl InferenceEngine {
                 &self.device,
             ))
         };
+
         let mut rng = match params.seed {
             Some(s) => StdRng::seed_from_u64(s),
             None => StdRng::from_entropy(),
@@ -178,7 +207,7 @@ impl InferenceEngine {
         tokens.push(next);
         generated.push(next);
         if is_stop(next, params) {
-            caches.clear();
+            caches.release();
             return Ok(tokens);
         }
 
@@ -245,7 +274,7 @@ impl InferenceEngine {
                     generated.push(t);
                     next = t;
                     if is_stop(t, params) || generated.len() >= max_new_tokens {
-                        caches.clear();
+                        caches.release();
                         tracing::info!(
                             drafted = total_stats.drafted,
                             scheduled = total_stats.scheduled,
@@ -281,7 +310,7 @@ impl InferenceEngine {
                 "Tesla stats (chunk verify)"
             );
         }
-        caches.clear();
+        caches.release();
         Ok(tokens)
     }
 

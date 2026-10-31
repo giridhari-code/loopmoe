@@ -1,6 +1,10 @@
-//! KV cache — preallocated capacity to avoid O(n²) Tensor::cat growth.
+//! KV / MLA cache — preallocated capacity to avoid O(n²) Tensor::cat growth.
 
 use candle_core::{DType, Device, Result as CandleResult, Tensor};
+
+// ---------------------------------------------------------------------------
+// GQA KV cache
+// ---------------------------------------------------------------------------
 
 #[derive(Debug)]
 pub struct KvCache {
@@ -71,7 +75,9 @@ impl KvCache {
 
     fn grow_to(&mut self, need: usize) -> CandleResult<()> {
         if self.k.is_none() {
-            if need > self.capacity { self.capacity = need; }
+            if need > self.capacity {
+                self.capacity = need;
+            }
             return Ok(());
         }
         if need <= self.capacity {
@@ -112,12 +118,11 @@ impl KvCache {
         self.ensure_allocated()?;
 
         let start = self.len;
-        let end = start + s_new;
         let k = self.k.as_ref().unwrap();
         let v = self.v.as_ref().unwrap();
         k.slice_set(&new_k.contiguous()?, 2, start)?;
         v.slice_set(&new_v.contiguous()?, 2, start)?;
-        self.len = end;
+        self.len = start + s_new;
         Ok(())
     }
 
@@ -139,7 +144,6 @@ impl KvCache {
         self.len = 0;
     }
 
-    /// Rewind to an earlier length (stale entries get overwritten on next append).
     pub fn set_len(&mut self, len: usize) {
         self.len = len.min(self.capacity);
     }
@@ -223,60 +227,265 @@ pub fn kv_bytes_estimate(
     num_layers * 2 * batch * num_kv_heads * head_dim * seq * bytes_per_elem
 }
 
-// ---------------- MLA cache (latent c_kv + rope key) ----------------
+// ---------------------------------------------------------------------------
+// MLA cache (latent c_kv + rope key) — same RAM strategy as GQA
+// c:    (batch, capacity, rank)
+// k_pe: (batch, 1, capacity, rope_dim)
+// ---------------------------------------------------------------------------
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MlaCache {
-    c: Option<Tensor>,    // (b, len, rank)
-    k_pe: Option<Tensor>, // (b, 1, len, rope_dim)
+    c: Option<Tensor>,
+    k_pe: Option<Tensor>,
     len: usize,
+    capacity: usize,
+    batch: usize,
+    rank: usize,
+    rope_dim: usize,
+    dtype: DType,
+    device: Device,
 }
 
 impl MlaCache {
-    pub fn new() -> Self { Self::default() }
-    pub fn seq_len(&self) -> usize { self.len }
+    pub fn empty() -> Self {
+        Self {
+            c: None,
+            k_pe: None,
+            len: 0,
+            capacity: 0,
+            batch: 1,
+            rank: 0,
+            rope_dim: 0,
+            dtype: DType::F32,
+            device: Device::Cpu,
+        }
+    }
 
+    /// Preallocate for `capacity` sequence positions.
+    pub fn with_capacity(
+        batch: usize,
+        rank: usize,
+        rope_dim: usize,
+        capacity: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Self {
+        Self {
+            c: None,
+            k_pe: None,
+            len: 0,
+            capacity: capacity.max(1),
+            batch,
+            rank,
+            rope_dim,
+            dtype,
+            device: device.clone(),
+        }
+    }
+
+    pub fn seq_len(&self) -> usize {
+        self.len
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    fn ensure_allocated(&mut self) -> CandleResult<()> {
+        if self.c.is_some() {
+            return Ok(());
+        }
+        let c_shape = (self.batch, self.capacity, self.rank);
+        let k_shape = (self.batch, 1, self.capacity, self.rope_dim);
+        self.c = Some(Tensor::zeros(c_shape, self.dtype, &self.device)?);
+        self.k_pe = Some(Tensor::zeros(k_shape, self.dtype, &self.device)?);
+        Ok(())
+    }
+
+    fn grow_to(&mut self, need: usize) -> CandleResult<()> {
+        if self.c.is_none() {
+            if need > self.capacity {
+                self.capacity = need;
+            }
+            return Ok(());
+        }
+        if need <= self.capacity {
+            return Ok(());
+        }
+        let new_cap = need.max(self.capacity.max(1) * 2).max(need);
+        let mut new_c = Tensor::zeros((self.batch, new_cap, self.rank), self.dtype, &self.device)?;
+        let mut new_k =
+            Tensor::zeros((self.batch, 1, new_cap, self.rope_dim), self.dtype, &self.device)?;
+        if let (Some(oc), Some(ok)) = (&self.c, &self.k_pe) {
+            if self.len > 0 {
+                let old_c = oc.narrow(1, 0, self.len)?;
+                let old_k = ok.narrow(2, 0, self.len)?;
+                let tail_c = new_c.narrow(1, self.len, new_cap - self.len)?;
+                let tail_k = new_k.narrow(2, self.len, new_cap - self.len)?;
+                new_c = Tensor::cat(&[&old_c, &tail_c], 1)?;
+                new_k = Tensor::cat(&[&old_k, &tail_k], 2)?;
+            }
+        }
+        self.c = Some(new_c);
+        self.k_pe = Some(new_k);
+        self.capacity = new_cap;
+        Ok(())
+    }
+
+    /// In-place append — no O(n²) cat on the hot path.
+    /// `c_kv`: (B, S, rank)   `k_pe`: (B, 1, S, rope_dim)
     pub fn append(&mut self, c_kv: &Tensor, k_pe: &Tensor) -> CandleResult<()> {
         let s_new = c_kv.dim(1)?;
-        let (c, k) = match (&self.c, &self.k_pe) {
-            (Some(c0), Some(k0)) => {
-                let c0 = c0.narrow(1, 0, self.len)?;
-                let k0 = k0.narrow(2, 0, self.len)?;
-                (Tensor::cat(&[&c0, c_kv], 1)?, Tensor::cat(&[&k0, k_pe], 2)?)
-            }
-            _ => (c_kv.clone(), k_pe.clone()),
-        };
-        self.c = Some(c);
-        self.k_pe = Some(k);
-        self.len += s_new;
+        let need = self.len + s_new;
+
+        if self.capacity == 0 || self.rank == 0 {
+            self.batch = c_kv.dim(0)?;
+            self.rank = c_kv.dim(2)?;
+            self.rope_dim = k_pe.dim(3)?;
+            self.dtype = c_kv.dtype();
+            self.device = c_kv.device().clone();
+            self.capacity = need.max(64);
+        }
+
+        self.grow_to(need)?;
+        self.ensure_allocated()?;
+
+        let start = self.len;
+        let c = self.c.as_ref().unwrap();
+        let k = self.k_pe.as_ref().unwrap();
+        c.slice_set(&c_kv.contiguous()?, 1, start)?;
+        k.slice_set(&k_pe.contiguous()?, 2, start)?;
+        self.len = start + s_new;
         Ok(())
     }
 
     pub fn c_view(&self) -> CandleResult<Option<Tensor>> {
-        match &self.c { Some(c) if self.len > 0 => Ok(Some(c.narrow(1, 0, self.len)?)), _ => Ok(None) }
+        if self.len == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.c.as_ref().unwrap().narrow(1, 0, self.len)?))
     }
 
     pub fn k_pe_view(&self) -> CandleResult<Option<Tensor>> {
-        match &self.k_pe { Some(k) if self.len > 0 => Ok(Some(k.narrow(2, 0, self.len)?)), _ => Ok(None) }
+        if self.len == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.k_pe.as_ref().unwrap().narrow(2, 0, self.len)?))
     }
 
-    pub fn clear(&mut self) { self.c = None; self.k_pe = None; self.len = 0; }
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
 
-    pub fn set_len(&mut self, len: usize) { self.len = len.min(self.len); }
+    pub fn set_len(&mut self, len: usize) {
+        self.len = len.min(if self.capacity > 0 {
+            self.capacity
+        } else {
+            self.len
+        });
+    }
+
+    pub fn release(&mut self) {
+        self.c = None;
+        self.k_pe = None;
+        self.len = 0;
+    }
 }
 
-#[derive(Debug, Default)]
+impl Default for MlaCache {
+    fn default() -> Self {
+        Self::empty()
+    }
+}
+
+#[derive(Debug)]
 pub struct MlaCaches {
     pub layers: Vec<MlaCache>,
+    pub capacity: usize,
 }
 
 impl MlaCaches {
+    /// Lazy empty layers (no prealloc) — prefer `with_capacity`.
     pub fn new(num_layers: usize) -> Self {
-        Self { layers: (0..num_layers).map(|_| MlaCache::new()).collect() }
+        Self {
+            layers: (0..num_layers).map(|_| MlaCache::empty()).collect(),
+            capacity: 0,
+        }
+    }
+
+    /// Preallocate all layers for `capacity` tokens.
+    pub fn with_capacity(
+        num_layers: usize,
+        batch: usize,
+        kv_lora_rank: usize,
+        rope_dim: usize,
+        capacity: usize,
+        dtype: DType,
+        device: &Device,
+    ) -> Self {
+        let capacity = capacity.max(1);
+        Self {
+            layers: (0..num_layers)
+                .map(|_| {
+                    MlaCache::with_capacity(
+                        batch,
+                        kv_lora_rank,
+                        rope_dim,
+                        capacity,
+                        dtype,
+                        device,
+                    )
+                })
+                .collect(),
+            capacity,
+        }
+    }
+
+    pub fn clear(&mut self) {
+        for c in &mut self.layers {
+            c.clear();
+        }
+    }
+
+    pub fn release(&mut self) {
+        for c in &mut self.layers {
+            c.release();
+        }
+    }
+
+    pub fn current_len(&self) -> usize {
+        self.layers.first().map(|c| c.seq_len()).unwrap_or(0)
+    }
+
+    pub fn checkpoint_lens(&self) -> Vec<usize> {
+        self.layers.iter().map(|c| c.seq_len()).collect()
+    }
+
+    pub fn restore_lens(&mut self, lens: &[usize]) {
+        for (c, &l) in self.layers.iter_mut().zip(lens) {
+            c.set_len(l);
+        }
     }
 }
 
-/// Cache bank used by the model forward (GQA or MLA).
+/// Bytes for MLA latent cache: c_kv + k_pe per layer.
+pub fn mla_bytes_estimate(
+    num_layers: usize,
+    batch: usize,
+    kv_lora_rank: usize,
+    rope_dim: usize,
+    seq: usize,
+    bytes_per_elem: usize,
+) -> usize {
+    // c: (B, S, rank) + k_pe: (B, 1, S, rope)
+    let per_layer = batch * seq * kv_lora_rank + batch * seq * rope_dim;
+    num_layers * per_layer * bytes_per_elem
+}
+
+// ---------------------------------------------------------------------------
+// Unified runtime bank
+// ---------------------------------------------------------------------------
+
 #[derive(Debug)]
 pub enum RuntimeCaches {
     Gqa(LayerCaches),
@@ -287,28 +496,35 @@ impl RuntimeCaches {
     pub fn current_len(&self) -> usize {
         match self {
             RuntimeCaches::Gqa(b) => b.current_len(),
-            RuntimeCaches::Mla(b) => b.layers.first().map(|c| c.seq_len()).unwrap_or(0),
+            RuntimeCaches::Mla(b) => b.current_len(),
         }
     }
 
     pub fn clear(&mut self) {
         match self {
             RuntimeCaches::Gqa(b) => b.clear(),
-            RuntimeCaches::Mla(b) => for c in &mut b.layers { c.clear(); },
+            RuntimeCaches::Mla(b) => b.clear(),
+        }
+    }
+
+    pub fn release(&mut self) {
+        match self {
+            RuntimeCaches::Gqa(b) => b.release(),
+            RuntimeCaches::Mla(b) => b.release(),
         }
     }
 
     pub fn checkpoint_lens(&self) -> Vec<usize> {
         match self {
             RuntimeCaches::Gqa(b) => b.checkpoint_lens(),
-            RuntimeCaches::Mla(b) => b.layers.iter().map(|c| c.seq_len()).collect(),
+            RuntimeCaches::Mla(b) => b.checkpoint_lens(),
         }
     }
 
     pub fn restore_lens(&mut self, lens: &[usize]) {
         match self {
             RuntimeCaches::Gqa(b) => b.restore_lens(lens),
-            RuntimeCaches::Mla(b) => for (c, &l) in b.layers.iter_mut().zip(lens) { c.set_len(l); },
+            RuntimeCaches::Mla(b) => b.restore_lens(lens),
         }
     }
 }

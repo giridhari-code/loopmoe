@@ -15,7 +15,9 @@ pub mod parallel;
 pub use config::ModelConfig;
 pub use engine::InferenceEngine;
 pub use model::{LoopedMoE, SentinelV1};
-pub use cache::{KvCache, LayerCaches, MlaCache, MlaCaches, RuntimeCaches};
+pub use cache::{
+    KvCache, LayerCaches, MlaCache, MlaCaches, RuntimeCaches, kv_bytes_estimate, mla_bytes_estimate,
+};
 pub use kernels::{BackendKind, KERNEL_NAME};
 pub use sampler::SamplingParams;
 pub use tokenizer::Tokenizer;
