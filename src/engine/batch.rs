@@ -1,4 +1,4 @@
-//! BatchEngine — Orbit O3: chunked prefill + Tesla-in-schedule + Pulse B>1
+//! BatchEngine — Orbit O3–O5: chunked prefill, Tesla lane, Pulse B>1, prefix cache
 
 use std::collections::HashMap;
 
@@ -38,6 +38,7 @@ pub struct BatchMetrics {
     pub preempted: u64,
     pub pulse_decode_forwards: u64,
     pub pulse_prefill_forwards: u64,
+    pub prefix_hits: u64,
 }
 
 pub struct BatchEngine {
@@ -72,6 +73,7 @@ impl BatchEngine {
             head_dim: engine.config.head_dim,
             kv_lora_rank: engine.config.kv_lora_rank,
             rope_dim: engine.config.qk_rope_head_dim,
+            enable_prefix_cache: true,
         };
         Self {
             engine,
@@ -108,6 +110,7 @@ impl BatchEngine {
         max_tokens: usize,
         request_id: Option<String>,
     ) -> u64 {
+        let prompt_for_prefix = prompt_tokens.clone();
         let mut seq = Sequence::new(0, prompt_tokens);
         if let Some(rid) = request_id {
             seq = seq.with_request_id(rid);
@@ -122,9 +125,12 @@ impl BatchEngine {
         let id = self.scheduler.add_sequence(seq);
 
         if let Some(led) = self.ledger.as_mut() {
-            led.register_seq(id);
-            if let Some(s) = self.scheduler.get(id) {
-                let _ = led.ensure_tokens(id, s.prompt_len.max(1));
+            if led.config().enable_prefix_cache {
+                let hits = led.allocate_with_prefix(id, &prompt_for_prefix);
+                self.metrics.prefix_hits += hits as u64;
+            } else {
+                led.register_seq(id);
+                let _ = led.ensure_tokens(id, prompt_for_prefix.len().max(1));
             }
         }
 
@@ -185,7 +191,6 @@ impl BatchEngine {
             }
         }
 
-        // ── Chunked prefills ──────────────────────────────────────────────
         for chunk in &outputs.prefill_chunks {
             if self
                 .scheduler
@@ -200,7 +205,6 @@ impl BatchEngine {
             self.metrics.prefills += 1;
         }
 
-        // ── Plain decode via Pulse (B>1) ──────────────────────────────────
         let mut decode_items = Vec::new();
         for &id in &outputs.decode_ids {
             if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
@@ -236,7 +240,6 @@ impl BatchEngine {
             self.run_pulse_decode(&pack)?;
         }
 
-        // ── Tesla lane (from schedule) ────────────────────────────────────
         for &id in &outputs.tesla_ids {
             if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
                 continue;
@@ -244,12 +247,14 @@ impl BatchEngine {
             if self.scheduler.get(id).map(|s| s.is_prompt()).unwrap_or(false) {
                 continue;
             }
-            self.run_decode_tesla(id)?;
-            self.metrics.tesla_steps += 1;
-            self.metrics.decodes += 1;
+            // Tesla only if config present; else fall back plain path next step
+            if self.tesla.as_ref().map(|t| t.enabled).unwrap_or(false) {
+                self.run_decode_tesla(id)?;
+                self.metrics.tesla_steps += 1;
+                self.metrics.decodes += 1;
+            }
         }
 
-        // Finish reap
         let newly_done: Vec<u64> = self
             .scheduler
             .running_ids()
@@ -295,7 +300,7 @@ impl BatchEngine {
             prefill_chunks = self.metrics.prefill_chunks,
             decodes = self.metrics.decodes,
             tesla = self.metrics.tesla_steps,
-            pulse_dec = self.metrics.pulse_decode_forwards,
+            prefix_hits = self.metrics.prefix_hits,
             finished = self.metrics.finished,
             tokens = self.metrics.tokens_generated,
             "BatchEngine done"
@@ -314,12 +319,11 @@ impl BatchEngine {
         self.runtimes.get(&id).map(|r| &r.mtp)
     }
 
-    /// Chunked prefill: fill KV for [start, start+len). Sample only on last chunk.
     fn run_prefill_chunk(&mut self, id: u64, start: usize, len: usize) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
-        let (chunk_tokens, prompt_len, sampling, max_tokens) = {
+        let (chunk_tokens, prompt_len, sampling, max_tokens, prompt_snapshot) = {
             let seq = self
                 .scheduler
                 .get(id)
@@ -333,6 +337,7 @@ impl BatchEngine {
                 seq.prompt_len,
                 seq.sampling.clone(),
                 seq.stop.max_tokens,
+                seq.tokens[..seq.prompt_len.min(seq.tokens.len())].to_vec(),
             )
         };
         let actual_len = chunk_tokens.len();
@@ -358,6 +363,11 @@ impl BatchEngine {
         }
 
         if is_last {
+            // Seal prompt pages into prefix index for future requests
+            if let Some(led) = self.ledger.as_mut() {
+                led.seal_seq_prompt(id, &prompt_snapshot);
+            }
+
             let next = sample_token(&logits, &sampling, &rt.generated, &mut rt.rng)?;
             rt.generated.push(next);
             self.metrics.tokens_generated += 1;
