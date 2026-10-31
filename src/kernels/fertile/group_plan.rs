@@ -1,6 +1,71 @@
 //! Device-side token→expert grouping for Fertile.
+//!
+//! Supports capacity_factor based load balancing (DeepSeek / Switch style).
+//! Excess tokens beyond per-expert capacity are dropped (highest-score kept).
 
 use candle_core::{DType, Result as CandleResult, Tensor, D};
+
+/// Per-forward load statistics for monitoring imbalance + drops.
+#[derive(Debug, Clone, Default)]
+pub struct LoadStats {
+    /// Tokens assigned to each expert after capacity truncation.
+    pub tokens_per_expert: Vec<usize>,
+    /// Total token-expert assignments before capacity (t * k).
+    pub total_assignments: usize,
+    /// Assignments that survived capacity.
+    pub kept_assignments: usize,
+    /// Assignments dropped because expert was over capacity.
+    pub dropped_assignments: usize,
+    /// capacity used (same for all experts).
+    pub capacity: usize,
+    /// max tokens on any expert after truncation.
+    pub max_load: usize,
+    /// min tokens on any expert (can be 0).
+    pub min_load: usize,
+}
+
+impl LoadStats {
+    pub fn imbalance_ratio(&self) -> f32 {
+        if self.min_load == 0 {
+            if self.max_load == 0 {
+                1.0
+            } else {
+                f32::INFINITY
+            }
+        } else {
+            self.max_load as f32 / self.min_load as f32
+        }
+    }
+
+    pub fn drop_rate(&self) -> f32 {
+        if self.total_assignments == 0 {
+            0.0
+        } else {
+            self.dropped_assignments as f32 / self.total_assignments as f32
+        }
+    }
+
+    pub fn coefficient_of_variation(&self) -> f32 {
+        let n = self.tokens_per_expert.len();
+        if n == 0 {
+            return 0.0;
+        }
+        let mean = self.kept_assignments as f32 / n as f32;
+        if mean <= 0.0 {
+            return 0.0;
+        }
+        let var: f32 = self
+            .tokens_per_expert
+            .iter()
+            .map(|&c| {
+                let d = c as f32 - mean;
+                d * d
+            })
+            .sum::<f32>()
+            / n as f32;
+        var.sqrt() / mean
+    }
+}
 
 pub struct DeviceGroupPlan {
     pub sorted_tokens: Tensor,
@@ -8,17 +73,36 @@ pub struct DeviceGroupPlan {
     pub expert_offsets: Vec<usize>,
     pub n_experts: usize,
     pub n_active: usize,
+    /// Load balancing stats (after capacity truncation).
+    pub load_stats: LoadStats,
 }
 
 impl DeviceGroupPlan {
+    /// Original path (no capacity limit). Kept for compatibility.
     pub fn from_topk(
         topk_ids: &Tensor,
         topk_w: &Tensor,
         n_experts: usize,
         scale: f32,
     ) -> CandleResult<Self> {
+        Self::from_topk_with_capacity(topk_ids, topk_w, n_experts, scale, 0.0)
+    }
+
+    /// Capacity-aware grouping.
+    ///
+    /// `capacity_factor <= 0.0` disables capacity (keeps all tokens).
+    /// Otherwise:
+    ///   capacity = max(1, ceil(capacity_factor * (t * k) / n_experts))
+    /// For each expert we keep at most `capacity` highest-weight tokens and drop the rest.
+    pub fn from_topk_with_capacity(
+        topk_ids: &Tensor,
+        topk_w: &Tensor,
+        n_experts: usize,
+        scale: f32,
+        capacity_factor: f32,
+    ) -> CandleResult<Self> {
         let (t, k) = topk_ids.dims2()?;
-        let n = t * k;
+        let total = t * k;
         let device = topk_ids.device();
 
         let token_ids = Tensor::arange(0u32, t as u32, device)?
@@ -34,19 +118,88 @@ impl DeviceGroupPlan {
             .to_dtype(DType::F32)?
             .affine(scale as f64, 0.0)?;
 
-        let order = argsort_i64(&flat_experts)?;
-        let sorted_experts = flat_experts.gather(&order, 0)?;
-        let sorted_tokens = token_ids.gather(&order, 0)?;
-        let sorted_weights = flat_w.gather(&order, 0)?;
+        // Pull to host for capacity truncation (offsets already host-side).
+        let experts_v = flat_experts.to_vec1::<i64>()?;
+        let tokens_v = token_ids.to_vec1::<i64>()?;
+        let weights_v = flat_w.to_vec1::<f32>()?;
+
+        // Group (token, weight) per expert, then keep top-capacity by weight.
+        let mut per_expert: Vec<Vec<(i64, f32)>> = vec![Vec::new(); n_experts];
+        for i in 0..total {
+            let e = experts_v[i];
+            if e >= 0 && (e as usize) < n_experts {
+                per_expert[e as usize].push((tokens_v[i], weights_v[i]));
+            }
+        }
+
+        let capacity = if capacity_factor <= 0.0 || n_experts == 0 {
+            usize::MAX // no limit
+        } else {
+            let ideal = (capacity_factor * total as f32) / n_experts as f32;
+            (ideal.ceil() as usize).max(1)
+        };
+
+        let mut kept_tokens: Vec<i64> = Vec::with_capacity(total);
+        let mut kept_weights: Vec<f32> = Vec::with_capacity(total);
+        let mut kept_experts: Vec<i64> = Vec::with_capacity(total);
+        let mut tokens_per_expert = vec![0usize; n_experts];
+        let mut dropped = 0usize;
+
+        for (e, mut list) in per_expert.into_iter().enumerate() {
+            if list.len() > capacity {
+                // Keep highest weight
+                list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                dropped += list.len() - capacity;
+                list.truncate(capacity);
+            }
+            tokens_per_expert[e] = list.len();
+            for (tok, w) in list {
+                kept_tokens.push(tok);
+                kept_weights.push(w);
+                kept_experts.push(e as i64);
+            }
+        }
+
+        let kept = kept_tokens.len();
+        let max_load = tokens_per_expert.iter().copied().max().unwrap_or(0);
+        let min_load = tokens_per_expert.iter().copied().min().unwrap_or(0);
+
+        let load_stats = LoadStats {
+            tokens_per_expert,
+            total_assignments: total,
+            kept_assignments: kept,
+            dropped_assignments: dropped,
+            capacity: if capacity == usize::MAX { 0 } else { capacity },
+            max_load,
+            min_load,
+        };
+
+        // Build final sorted tensors (already grouped by expert).
+        let sorted_tokens = Tensor::from_vec(kept_tokens, (kept,), device)?;
+        let sorted_weights = Tensor::from_vec(kept_weights, (kept,), device)?;
+        let sorted_experts = Tensor::from_vec(kept_experts, (kept,), device)?;
 
         let expert_offsets = segment_offsets_fast(&sorted_experts, n_experts)?;
+
+        if dropped > 0 {
+            tracing::debug!(
+                capacity = load_stats.capacity,
+                dropped,
+                drop_rate = %format!("{:.2}%", load_stats.drop_rate() * 100.0),
+                max_load,
+                min_load,
+                imbalance = %format!("{:.2}", load_stats.imbalance_ratio()),
+                "MoE capacity drop applied"
+            );
+        }
 
         Ok(Self {
             sorted_tokens,
             sorted_weights,
             expert_offsets,
             n_experts,
-            n_active: n,
+            n_active: kept,
+            load_stats,
         })
     }
 
@@ -74,22 +227,9 @@ impl DeviceGroupPlan {
     pub fn occupancy(&self) -> &[usize] {
         &self.expert_offsets
     }
-}
 
-fn argsort_i64(x: &Tensor) -> CandleResult<Tensor> {
-    let x2 = if x.rank() == 1 {
-        x.unsqueeze(0)?
-    } else {
-        x.clone()
-    };
-    match x2.arg_sort_last_dim(true) {
-        Ok(order) => Ok(order.flatten_all()?),
-        Err(_) => {
-            let v = x.flatten_all()?.to_vec1::<i64>()?;
-            let mut idx: Vec<i64> = (0..v.len() as i64).collect();
-            idx.sort_by_key(|&i| v[i as usize]);
-            Tensor::from_vec(idx, (v.len(),), x.device())
-        }
+    pub fn load_stats(&self) -> &LoadStats {
+        &self.load_stats
     }
 }
 
