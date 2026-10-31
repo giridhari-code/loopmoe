@@ -1,24 +1,12 @@
-//! /v1/completions and /v1/chat/completions handlers
+//! Router factory — prefers Frontier when state is available.
 
 use axum::{
-    routing::{get, post},
+    routing::get,
     Router,
 };
 
-/// Build the main API router
+/// Placeholder router without engine state (tests / health only).
+/// Production binary uses `loopmoe::frontier::frontier_router`.
 pub fn create_router() -> Router {
-    Router::new()
-        .route("/health", get(|| async { "ok" }))
-        .route("/v1/completions", post(completions))
-        .route("/v1/chat/completions", post(chat_completions))
-}
-
-async fn completions() -> &'static str {
-    // TODO: wire to scheduler + engine
-    "not implemented"
-}
-
-async fn chat_completions() -> &'static str {
-    // TODO: wire to scheduler + engine
-    "not implemented"
+    Router::new().route("/health", get(|| async { "ok" }))
 }

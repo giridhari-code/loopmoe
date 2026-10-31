@@ -1,9 +1,9 @@
 //! # Frontier — Orbit O4 OpenAI-compatible HTTP API
 //!
-//! Front door for continuous-batch runtime. Today each request runs through
-//! `InferenceEngine` (Tesla optional). Multi-request continuous BatchEngine
-//! worker can plug in later without changing routes.
+//! Routes request traffic onto `InferenceEngine` (optional Tesla).
+//! Continuous BatchEngine can replace the generate path later without route changes.
 
+use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
@@ -17,12 +17,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::stream::{self, StreamExt};
+use futures::stream;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use uuid::Uuid;
 
+use crate::config::ModelConfig;
 use crate::engine::InferenceEngine;
 use crate::recipe::{ChatCompletionRequest, RecipePipeline};
 use crate::sampler::SamplingParams;
@@ -30,7 +32,6 @@ use crate::tesla::TeslaConfig;
 use crate::tokenizer::Tokenizer;
 use crate::Result;
 
-/// Shared server state.
 pub struct FrontierState {
     pub engine: Mutex<InferenceEngine>,
     pub tokenizer: Tokenizer,
@@ -56,7 +57,6 @@ impl FrontierState {
     }
 }
 
-/// Build Axum router for Frontier.
 pub fn frontier_router(state: Arc<FrontierState>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -67,43 +67,51 @@ pub fn frontier_router(state: Arc<FrontierState>) -> Router {
         .with_state(state)
 }
 
-/// Bind and serve (blocks).
 pub async fn serve(state: Arc<FrontierState>, host: [u8; 4], port: u16) -> Result<()> {
     let app = frontier_router(state);
     let addr = SocketAddr::from((host, port));
-    tracing::info!(%addr, "Frontier OpenAI-compatible server (Orbit O4)");
+    tracing::info!(%addr, "Frontier server (Orbit O4)");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
+pub fn load_frontier(
+    model_path: &Path,
+    config: ModelConfig,
+    tokenizer: Tokenizer,
+    tesla: Option<TeslaConfig>,
+) -> Result<FrontierState> {
+    let model_id = config.model_name.clone();
+    let engine = InferenceEngine::from_safetensors(model_path, config)?;
+    Ok(FrontierState::new(engine, tokenizer, model_id, tesla))
+}
+
 async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "runtime": "orbit", "phase": "O4" }))
+    Json(json!({ "status": "ok", "runtime": "orbit", "phase": "O4-frontier" }))
 }
 
 async fn list_models(State(state): State<Arc<FrontierState>>) -> impl IntoResponse {
-    let now = now_secs();
     Json(json!({
         "object": "list",
         "data": [{
             "id": state.model_id,
             "object": "model",
-            "created": now,
+            "created": now_secs(),
             "owned_by": "loopmoe"
         }]
     }))
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 struct CompletionBody {
     #[serde(default)]
     model: Option<String>,
     prompt: String,
     max_tokens: Option<usize>,
-    temperature: Option<f32>,
-    top_p: Option<f32>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
     stream: Option<bool>,
-    stop: Option<Vec<String>>,
 }
 
 async fn completions(
@@ -113,25 +121,18 @@ async fn completions(
     let max_tokens = body.max_tokens.unwrap_or(256);
     let mut sampling = SamplingParams::default();
     if let Some(t) = body.temperature {
-        sampling.temperature = t as f64;
+        sampling.temperature = t;
     }
     if let Some(p) = body.top_p {
-        sampling.top_p = p as f64;
-    }
-    if let Some(stop) = body.stop {
-        // stop strings handled at sampler token-id level when configured
-        let _ = stop;
+        sampling.top_p = p;
     }
 
     let input_ids = match state.tokenizer.encode(&body.prompt) {
         Ok(ids) => ids,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    let stream = body.stream.unwrap_or(false);
-    match generate_tokens(&state, &input_ids, max_tokens, &sampling).await {
+    match generate(&state, &input_ids, max_tokens, &sampling).await {
         Ok(full_ids) => {
             let prompt_len = input_ids.len();
             let gen = if full_ids.len() > prompt_len {
@@ -140,12 +141,11 @@ async fn completions(
                 &[]
             };
             let text = state.tokenizer.decode(gen).unwrap_or_default();
-            if stream {
-                return sse_completion_stream(&state.model_id, &text).into_response();
+            if body.stream.unwrap_or(false) {
+                return completion_sse(&state.model_id, &text).into_response();
             }
-            let id = format!("cmpl-{}", Uuid::new_v4());
             Json(json!({
-                "id": id,
+                "id": format!("cmpl-{}", Uuid::new_v4()),
                 "object": "text_completion",
                 "created": now_secs(),
                 "model": body.model.unwrap_or_else(|| state.model_id.clone()),
@@ -168,12 +168,10 @@ async fn chat_completions(
     let stream = req.stream.unwrap_or(false);
     let prepared = match state.recipe.prepare(&req, &state.tokenizer) {
         Ok(p) => p,
-        Err(e) => {
-            return (StatusCode::BAD_REQUEST, e.to_string()).into_response();
-        }
+        Err(e) => return (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
     };
 
-    match generate_tokens(
+    match generate(
         &state,
         &prepared.input_ids,
         prepared.max_tokens,
@@ -190,7 +188,7 @@ async fn chat_completions(
                     Vec::new()
                 };
                 let text = state.tokenizer.decode(&gen).unwrap_or_default();
-                return sse_chat_stream(&state.model_id, &text).into_response();
+                return chat_sse(&state.model_id, &text).into_response();
             }
             match state
                 .recipe
@@ -204,39 +202,24 @@ async fn chat_completions(
     }
 }
 
-async fn generate_tokens(
+async fn generate(
     state: &FrontierState,
     input_ids: &[u32],
     max_tokens: usize,
     sampling: &SamplingParams,
 ) -> Result<Vec<u32>> {
-    let tesla = state.tesla.clone();
-    let input = input_ids.to_vec();
+    let input_ids = input_ids.to_vec();
     let sampling = sampling.clone();
-    // InferenceEngine is !Send across await without mutex; lock + spawn_blocking
-    let engine = &state.engine;
-    tokio::task::spawn_blocking({
-        let input = input;
-        let sampling = sampling;
-        let tesla = tesla;
-        move || {
-            // We need the mutex — spawn_blocking can't hold axum state mutex across easily
-            // so caller must lock. Use block_in_place from async instead.
-            let _ = (&input, &sampling, &tesla);
-            Err(anyhow::anyhow!("internal: use generate_tokens_locked"))
-        }
-    });
-    // Prefer block_in_place + try_lock path
+    let tesla = state.tesla.clone();
+
     tokio::task::block_in_place(|| {
-        let mut eng = state
-            .engine
-            .blocking_lock();
-        if let Some(ref cfg) = state.tesla {
+        let mut eng = state.engine.blocking_lock();
+        if let Some(ref cfg) = tesla {
             if cfg.enabled {
-                return eng.generate_tesla(input_ids, max_tokens, sampling, cfg);
+                return eng.generate_tesla(&input_ids, max_tokens, &sampling, cfg);
             }
         }
-        eng.generate(input_ids, max_tokens, sampling)
+        eng.generate(&input_ids, max_tokens, &sampling)
     })
 }
 
@@ -247,17 +230,19 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-fn sse_chat_stream(model: &str, text: &str) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + use<>> {
+fn chat_sse(
+    model: &str,
+    text: &str,
+) -> Sse<stream::Iter<std::vec::IntoIter<std::result::Result<Event, Infallible>>>> {
     let id = format!("chatcmpl-{}", Uuid::new_v4());
     let model = model.to_string();
-    // Word-ish chunks for streaming UX
-    let chunks: Vec<String> = text
+    let mut events = Vec::new();
+    let pieces: Vec<&str> = text
         .split_inclusive(char::is_whitespace)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
         .collect();
-    let n = chunks.len();
-    let stream = stream::iter(chunks.into_iter().enumerate().map(move |(i, piece)| {
+    let n = pieces.len();
+    for (i, piece) in pieces.into_iter().enumerate() {
         let body = json!({
             "id": id,
             "object": "chat.completion.chunk",
@@ -266,26 +251,38 @@ fn sse_chat_stream(model: &str, text: &str) -> Sse<impl futures::Stream<Item = R
             "choices": [{
                 "index": 0,
                 "delta": { "content": piece },
-                "finish_reason": if i + 1 == n { serde_json::Value::String("stop".into()) } else { serde_json::Value::Null }
+                "finish_reason": if i + 1 == n { json!("stop") } else { json!(null) }
             }]
         });
-        Ok(Event::default().data(body.to_string()))
-    }))
-    .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
+        events.push(Ok(Event::default().data(body.to_string())));
+    }
+    if n == 0 {
+        let body = json!({
+            "id": id,
+            "object": "chat.completion.chunk",
+            "created": now_secs(),
+            "model": model,
+            "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+        });
+        events.push(Ok(Event::default().data(body.to_string())));
+    }
+    events.push(Ok(Event::default().data("[DONE]")));
+    Sse::new(stream::iter(events)).keep_alive(KeepAlive::default())
 }
 
-fn sse_completion_stream(model: &str, text: &str) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>> + use<>> {
+fn completion_sse(
+    model: &str,
+    text: &str,
+) -> Sse<stream::Iter<std::vec::IntoIter<std::result::Result<Event, Infallible>>>> {
     let id = format!("cmpl-{}", Uuid::new_v4());
     let model = model.to_string();
-    let chunks: Vec<String> = text
+    let mut events = Vec::new();
+    let pieces: Vec<&str> = text
         .split_inclusive(char::is_whitespace)
         .filter(|s| !s.is_empty())
-        .map(|s| s.to_string())
         .collect();
-    let n = chunks.len();
-    let stream = stream::iter(chunks.into_iter().enumerate().map(move |(i, piece)| {
+    let n = pieces.len();
+    for (i, piece) in pieces.into_iter().enumerate() {
         let body = json!({
             "id": id,
             "object": "text_completion",
@@ -294,24 +291,11 @@ fn sse_completion_stream(model: &str, text: &str) -> Sse<impl futures::Stream<It
             "choices": [{
                 "text": piece,
                 "index": 0,
-                "finish_reason": if i + 1 == n { serde_json::Value::String("stop".into()) } else { serde_json::Value::Null }
+                "finish_reason": if i + 1 == n { json!("stop") } else { json!(null) }
             }]
         });
-        Ok(Event::default().data(body.to_string()))
-    }))
-    .chain(stream::once(async { Ok(Event::default().data("[DONE]")) }));
-
-    Sse::new(stream).keep_alive(KeepAlive::default())
-}
-
-/// Helper: load Frontier from model path (used by binary).
-pub fn load_frontier(
-    model_path: &Path,
-    config: crate::config::ModelConfig,
-    tokenizer: Tokenizer,
-    tesla: Option<TeslaConfig>,
-) -> Result<FrontierState> {
-    let model_id = config.model_name.clone();
-    let engine = InferenceEngine::from_safetensors(model_path, config)?;
-    Ok(FrontierState::new(engine, tokenizer, model_id, tesla))
+        events.push(Ok(Event::default().data(body.to_string())));
+    }
+    events.push(Ok(Event::default().data("[DONE]")));
+    Sse::new(stream::iter(events)).keep_alive(KeepAlive::default())
 }

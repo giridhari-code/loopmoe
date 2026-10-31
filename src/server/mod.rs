@@ -1,7 +1,4 @@
-//! OpenAI-compatible HTTP server
-//!
-//! Routes: /v1/completions, /v1/chat/completions
-//! Streaming via SSE, auth + rate-limit middleware
+//! OpenAI-compatible HTTP surface (delegates to Frontier / Orbit O4).
 
 pub mod routes;
 pub mod openai_types;

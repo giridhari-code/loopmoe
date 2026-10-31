@@ -1,13 +1,16 @@
 //! loopmoe / Sentinel — high-performance Looped-MoE inference runtime
 //!
-//! **Orbit** runtime: BlockLedger (O1) · PackedBatch/Pulse B>1 (O2/O2.1) ·
-//! chunked prefill + Tesla-in-schedule (O3).
+//! **Orbit**: O1 BlockLedger · O2/O2.1 PackedBatch · O3 chunked prefill + Tesla schedule ·
+//! **O4 Frontier** OpenAI HTTP API.
 
 pub mod config;
 pub mod error;
 
 #[cfg(feature = "server")]
 pub mod server;
+
+#[cfg(feature = "server")]
+pub mod frontier;
 
 pub mod orbit;
 pub mod scheduler;
@@ -50,5 +53,8 @@ pub use orbit::{
     PackItem, PackResolve, PackRole, PackedBatch, Pulse, PulseMetrics, PulseOutput, SeqBlockTable,
     SlotMapping,
 };
+
+#[cfg(feature = "server")]
+pub use frontier::{frontier_router, load_frontier, serve, FrontierState};
 
 pub type Result<T> = anyhow::Result<T>;
