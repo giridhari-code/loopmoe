@@ -1,4 +1,6 @@
 // FP8 E4M3 kernels for Sentinel / DoBu
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <math.h>
 #include "fp8.cuh"
 
@@ -27,12 +29,12 @@ extern "C" __global__ void sentinel_gemm_nn_fp8w_f32(
     float *C, const float *A, const unsigned char *B,
     float scale, int M, int N, int K
 ) {
-    __shared__ float As[TILE][TILE];
-    __shared__ float Bs[TILE][TILE];
+    __shared__ float As[TILE][TILE + 1];
+    __shared__ float Bs[TILE][TILE + 1];
     int row = blockIdx.y * TILE + threadIdx.y;
     int col = blockIdx.x * TILE + threadIdx.x;
     float acc = 0.f;
-    int tiles = (K + TILE - 1) / TILE;
+    int tiles = K / TILE + (K % TILE != 0);
     for (int t = 0; t < tiles; ++t) {
         int a_col = t * TILE + threadIdx.x;
         int b_row = t * TILE + threadIdx.y;
@@ -45,10 +47,39 @@ extern "C" __global__ void sentinel_gemm_nn_fp8w_f32(
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < TILE; ++i)
-            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+            acc = fmaf(As[threadIdx.y][i], Bs[i][threadIdx.x], acc);
         __syncthreads();
     }
     if (row < M && col < N) C[row * N + col] = acc;
+}
+
+// A f16 activations, B fp8 weights, out f16
+extern "C" __global__ void sentinel_gemm_nn_fp8w_f16(
+    __half *C, const __half *A, const unsigned char *B,
+    float scale, int M, int N, int K
+) {
+    __shared__ float As[TILE][TILE + 1];
+    __shared__ float Bs[TILE][TILE + 1];
+    int row = blockIdx.y * TILE + threadIdx.y;
+    int col = blockIdx.x * TILE + threadIdx.x;
+    float acc = 0.f;
+    int tiles = K / TILE + (K % TILE != 0);
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * TILE + threadIdx.x;
+        int b_row = t * TILE + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && a_col < K) ? __half2float(A[row * K + a_col]) : 0.f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (b_row < K && col < N)
+                ? fp8_e4m3_to_float(B[b_row * N + col]) * scale
+                : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < TILE; ++i)
+            acc = fmaf(As[threadIdx.y][i], Bs[i][threadIdx.x], acc);
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row * N + col] = __float2half(acc);
 }
 
 // A bf16 activations, B fp8 weights, out bf16
@@ -56,12 +87,12 @@ extern "C" __global__ void sentinel_gemm_nn_fp8w_bf16(
     __nv_bfloat16 *C, const __nv_bfloat16 *A, const unsigned char *B,
     float scale, int M, int N, int K
 ) {
-    __shared__ float As[TILE][TILE];
-    __shared__ float Bs[TILE][TILE];
+    __shared__ float As[TILE][TILE + 1];
+    __shared__ float Bs[TILE][TILE + 1];
     int row = blockIdx.y * TILE + threadIdx.y;
     int col = blockIdx.x * TILE + threadIdx.x;
     float acc = 0.f;
-    int tiles = (K + TILE - 1) / TILE;
+    int tiles = K / TILE + (K % TILE != 0);
     for (int t = 0; t < tiles; ++t) {
         int a_col = t * TILE + threadIdx.x;
         int b_row = t * TILE + threadIdx.y;
@@ -74,7 +105,7 @@ extern "C" __global__ void sentinel_gemm_nn_fp8w_bf16(
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < TILE; ++i)
-            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+            acc = fmaf(As[threadIdx.y][i], Bs[i][threadIdx.x], acc);
         __syncthreads();
     }
     if (row < M && col < N) C[row * N + col] = __float2bfloat16(acc);

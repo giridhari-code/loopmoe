@@ -93,8 +93,10 @@ impl CustomOp2 for TiledGemmOp {
         let dev = sa.device();
         let func = dev.get_or_load_custom_func(kname, "sentinel_kernels", SENTINEL_PTX)?;
 
-        let grid_x = ((self.n as u32) + TILE - 1) / TILE;
-        let grid_y = ((self.m as u32) + TILE - 1) / TILE;
+        let n_u32 = self.n as u32;
+        let m_u32 = self.m as u32;
+        let grid_x = n_u32 / TILE + u32::from(n_u32 % TILE != 0);
+        let grid_y = m_u32 / TILE + u32::from(m_u32 % TILE != 0);
         let cfg = LaunchConfig {
             grid_dim: (grid_x, grid_y, 1),
             block_dim: (TILE, TILE, 1),
@@ -167,6 +169,12 @@ pub fn tiled_gemm_nn(a: &Tensor, b: &Tensor) -> CResult<Tensor> {
     if k1 != k2 {
         candle_core::bail!("gemm_nn: K mismatch {k1} vs {k2}");
     }
+    if m == 0 || n == 0 || k1 == 0 {
+        candle_core::bail!("gemm_nn: dimensions must be non-zero");
+    }
+    if m > i32::MAX as usize || n > i32::MAX as usize || k1 > i32::MAX as usize {
+        candle_core::bail!("gemm_nn: dimension exceeds CUDA kernel limit");
+    }
     if a.device().is_cuda()
         && ptx_ready()
         && kernels_dtype_ok(a.dtype())
@@ -194,6 +202,12 @@ pub fn tiled_gemm_nt(a: &Tensor, b: &Tensor) -> CResult<Tensor> {
     let (n, k2) = b.dims2()?;
     if k1 != k2 {
         candle_core::bail!("gemm_nt: K mismatch");
+    }
+    if m == 0 || n == 0 || k1 == 0 {
+        candle_core::bail!("gemm_nt: dimensions must be non-zero");
+    }
+    if m > i32::MAX as usize || n > i32::MAX as usize || k1 > i32::MAX as usize {
+        candle_core::bail!("gemm_nt: dimension exceeds CUDA kernel limit");
     }
     if a.device().is_cuda()
         && ptx_ready()

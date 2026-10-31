@@ -67,12 +67,12 @@ extern "C" __global__ void sentinel_scale_bf16(
 
 extern "C" __global__ void sentinel_scatter_add_rows_f32(
     float *out, const int *idx, const float *values,
-    unsigned int n, unsigned int h
+    unsigned int n, unsigned int h, unsigned int out_rows
 ) {
     unsigned int row = blockIdx.x;
     if (row >= n) return;
     int dest = idx[row];
-    if (dest < 0) return;
+    if (dest < 0 || (unsigned int)dest >= out_rows) return;
     for (unsigned int c = threadIdx.x; c < h; c += blockDim.x) {
         atomicAdd(&out[(unsigned int)dest * h + c], values[row * h + c]);
     }
@@ -82,7 +82,7 @@ __device__ __forceinline__ void atomicAddHalf(__half *addr, __half val) {
 #if __CUDA_ARCH__ >= 700
     atomicAdd(addr, val);
 #else
-    unsigned short *addr_as_us = (unsigned short *)addr;
+    volatile unsigned short *addr_as_us = (volatile unsigned short *)addr;
     unsigned short old = *addr_as_us, assumed;
     do {
         assumed = old;
@@ -94,12 +94,12 @@ __device__ __forceinline__ void atomicAddHalf(__half *addr, __half val) {
 
 extern "C" __global__ void sentinel_scatter_add_rows_f16(
     __half *out, const int *idx, const __half *values,
-    unsigned int n, unsigned int h
+    unsigned int n, unsigned int h, unsigned int out_rows
 ) {
     unsigned int row = blockIdx.x;
     if (row >= n) return;
     int dest = idx[row];
-    if (dest < 0) return;
+    if (dest < 0 || (unsigned int)dest >= out_rows) return;
     for (unsigned int c = threadIdx.x; c < h; c += blockDim.x) {
         atomicAddHalf(&out[(unsigned int)dest * h + c], values[row * h + c]);
     }
@@ -109,7 +109,7 @@ __device__ __forceinline__ void atomicAddBf16(__nv_bfloat16 *addr, __nv_bfloat16
 #if __CUDA_ARCH__ >= 800
     atomicAdd(addr, val);
 #else
-    unsigned short *addr_as_us = (unsigned short *)addr;
+    volatile unsigned short *addr_as_us = (volatile unsigned short *)addr;
     unsigned short old = *addr_as_us, assumed;
     do {
         assumed = old;
@@ -122,12 +122,12 @@ __device__ __forceinline__ void atomicAddBf16(__nv_bfloat16 *addr, __nv_bfloat16
 
 extern "C" __global__ void sentinel_scatter_add_rows_bf16(
     __nv_bfloat16 *out, const int *idx, const __nv_bfloat16 *values,
-    unsigned int n, unsigned int h
+    unsigned int n, unsigned int h, unsigned int out_rows
 ) {
     unsigned int row = blockIdx.x;
     if (row >= n) return;
     int dest = idx[row];
-    if (dest < 0) return;
+    if (dest < 0 || (unsigned int)dest >= out_rows) return;
     for (unsigned int c = threadIdx.x; c < h; c += blockDim.x) {
         atomicAddBf16(&out[(unsigned int)dest * h + c], values[row * h + c]);
     }
@@ -142,12 +142,12 @@ extern "C" __global__ void sentinel_gemm_nn_f32(
     float *C, const float *A, const float *B,
     int M, int N, int K
 ) {
-    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE];
-    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE];
+    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE + 1];
+    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE + 1];
     int row = blockIdx.y * SENTINEL_TILE + threadIdx.y;
     int col = blockIdx.x * SENTINEL_TILE + threadIdx.x;
     float acc = 0.f;
-    int tiles = (K + SENTINEL_TILE - 1) / SENTINEL_TILE;
+    int tiles = K / SENTINEL_TILE + (K % SENTINEL_TILE != 0);
     for (int t = 0; t < tiles; ++t) {
         int a_col = t * SENTINEL_TILE + threadIdx.x;
         int b_row = t * SENTINEL_TILE + threadIdx.y;
@@ -158,7 +158,7 @@ extern "C" __global__ void sentinel_gemm_nn_f32(
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < SENTINEL_TILE; ++i) {
-            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+            acc = fmaf(As[threadIdx.y][i], Bs[i][threadIdx.x], acc);
         }
         __syncthreads();
     }
@@ -169,12 +169,12 @@ extern "C" __global__ void sentinel_gemm_nn_f16(
     __half *C, const __half *A, const __half *B,
     int M, int N, int K
 ) {
-    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE];
-    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE];
+    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE + 1];
+    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE + 1];
     int row = blockIdx.y * SENTINEL_TILE + threadIdx.y;
     int col = blockIdx.x * SENTINEL_TILE + threadIdx.x;
     float acc = 0.f;
-    int tiles = (K + SENTINEL_TILE - 1) / SENTINEL_TILE;
+    int tiles = K / SENTINEL_TILE + (K % SENTINEL_TILE != 0);
     for (int t = 0; t < tiles; ++t) {
         int a_col = t * SENTINEL_TILE + threadIdx.x;
         int b_row = t * SENTINEL_TILE + threadIdx.y;
@@ -185,7 +185,7 @@ extern "C" __global__ void sentinel_gemm_nn_f16(
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < SENTINEL_TILE; ++i) {
-            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+            acc = fmaf(As[threadIdx.y][i], Bs[i][threadIdx.x], acc);
         }
         __syncthreads();
     }
@@ -196,12 +196,12 @@ extern "C" __global__ void sentinel_gemm_nn_bf16(
     __nv_bfloat16 *C, const __nv_bfloat16 *A, const __nv_bfloat16 *B,
     int M, int N, int K
 ) {
-    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE];
-    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE];
+    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE + 1];
+    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE + 1];
     int row = blockIdx.y * SENTINEL_TILE + threadIdx.y;
     int col = blockIdx.x * SENTINEL_TILE + threadIdx.x;
     float acc = 0.f;
-    int tiles = (K + SENTINEL_TILE - 1) / SENTINEL_TILE;
+    int tiles = K / SENTINEL_TILE + (K % SENTINEL_TILE != 0);
     for (int t = 0; t < tiles; ++t) {
         int a_col = t * SENTINEL_TILE + threadIdx.x;
         int b_row = t * SENTINEL_TILE + threadIdx.y;
@@ -212,7 +212,7 @@ extern "C" __global__ void sentinel_gemm_nn_bf16(
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < SENTINEL_TILE; ++i) {
-            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+            acc = fmaf(As[threadIdx.y][i], Bs[i][threadIdx.x], acc);
         }
         __syncthreads();
     }
@@ -224,12 +224,12 @@ extern "C" __global__ void sentinel_gemm_nt_f32(
     float *C, const float *A, const float *B,
     int M, int N, int K
 ) {
-    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE];
-    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE];
+    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE + 1];
+    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE + 1];
     int row = blockIdx.y * SENTINEL_TILE + threadIdx.y;
     int col = blockIdx.x * SENTINEL_TILE + threadIdx.x;
     float acc = 0.f;
-    int tiles = (K + SENTINEL_TILE - 1) / SENTINEL_TILE;
+    int tiles = K / SENTINEL_TILE + (K % SENTINEL_TILE != 0);
     for (int t = 0; t < tiles; ++t) {
         int a_col = t * SENTINEL_TILE + threadIdx.x;
         int b_col = t * SENTINEL_TILE + threadIdx.y; // B is (N,K): B[col, k]
@@ -241,7 +241,7 @@ extern "C" __global__ void sentinel_gemm_nt_f32(
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < SENTINEL_TILE; ++i) {
-            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+            acc = fmaf(As[threadIdx.y][i], Bs[i][threadIdx.x], acc);
         }
         __syncthreads();
     }

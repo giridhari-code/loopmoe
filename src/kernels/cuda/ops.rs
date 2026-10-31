@@ -106,8 +106,12 @@ impl CustomOp2 for SiluMulOp {
         })?;
         let dev = s1.device();
         let n = l1.shape().elem_count();
+        if n == 0 || n > u32::MAX as usize {
+            candle_core::bail!("silu_mul: element count exceeds CUDA kernel limit");
+        }
         let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
+        let n_u32 = n as u32;
+        let grid = n_u32 / block + u32::from(n_u32 % block != 0);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (block, 1, 1),
@@ -226,8 +230,12 @@ impl CustomOp1 for ScaleOp {
         })?;
         let dev = storage.device();
         let n = layout.shape().elem_count();
+        if n == 0 || n > u32::MAX as usize {
+            candle_core::bail!("scale: element count exceeds CUDA kernel limit");
+        }
         let block = 256u32;
-        let grid = ((n as u32) + block - 1) / block;
+        let n_u32 = n as u32;
+        let grid = n_u32 / block + u32::from(n_u32 % block != 0);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (block, 1, 1),
@@ -374,6 +382,7 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
         idx: Tensor,
         n: u32,
         h: u32,
+        out_rows: u32,
     }
     impl CustomOp2 for ScatterPair {
         fn name(&self) -> &'static str {
@@ -436,6 +445,7 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                     b.arg(&val);
                     b.arg(&self.n);
                     b.arg(&self.h);
+                    b.arg(&self.out_rows);
                     unsafe { b.launch(cfg) }.w()?;
                     Ok((
                         candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
@@ -453,6 +463,7 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                     b.arg(&val);
                     b.arg(&self.n);
                     b.arg(&self.h);
+                    b.arg(&self.out_rows);
                     unsafe { b.launch(cfg) }.w()?;
                     Ok((
                         candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
@@ -470,6 +481,7 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                     b.arg(&val);
                     b.arg(&self.n);
                     b.arg(&self.h);
+                    b.arg(&self.out_rows);
                     unsafe { b.launch(cfg) }.w()?;
                     Ok((
                         candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
@@ -485,6 +497,7 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
         idx: idx_i32,
         n: n as u32,
         h: h as u32,
+        out_rows: t as u32,
     };
     out.apply_op2_no_bwd(&vals, &op)
 }

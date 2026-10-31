@@ -50,8 +50,14 @@ pub fn dequant_fp8_e4m3(fp8: &Tensor, scale: f32) -> CResult<Tensor> {
 pub fn gemm_nn_fp8_weight(a: &Tensor, b_fp8: &Tensor, scale: f32) -> CResult<Tensor> {
     let (m, k1) = a.dims2()?;
     let (k2, n) = b_fp8.dims2()?;
+    if m == 0 || n == 0 || k1 == 0 {
+        candle_core::bail!("fp8 gemm dimensions must be non-zero");
+    }
     if k1 != k2 {
         candle_core::bail!("fp8 gemm K mismatch");
+    }
+    if m > i32::MAX as usize || n > i32::MAX as usize || k1 > i32::MAX as usize {
+        candle_core::bail!("fp8 gemm dimension exceeds CUDA kernel limit");
     }
 
     // Portable path: dequant weights → matmul (always correct)
@@ -101,7 +107,7 @@ fn gemm_nn_fp8_weight_cuda(
         m: i32,
         n: i32,
         k: i32,
-        out_bf16: bool,
+        output_dtype: DType,
     }
     impl CustomOp2 for Fp8Gemm {
         fn name(&self) -> &'static str {
@@ -127,18 +133,21 @@ fn gemm_nn_fp8_weight_cuda(
                 candle_core::bail!("fp8 ptx missing");
             }
             let dev = sa.device();
-            let kname = if self.out_bf16 {
-                "sentinel_gemm_nn_fp8w_bf16"
-            } else {
-                "sentinel_gemm_nn_fp8w_f32"
+            let kname = match self.output_dtype {
+                DType::F32 => "sentinel_gemm_nn_fp8w_f32",
+                DType::F16 => "sentinel_gemm_nn_fp8w_f16",
+                DType::BF16 => "sentinel_gemm_nn_fp8w_bf16",
+                _ => candle_core::bail!("unsupported fp8 gemm dtype"),
             };
             let func =
                 dev.get_or_load_custom_func(kname, "sentinel_fp8_kernels", SENTINEL_FP8_PTX)?;
             let tile = 16u32;
+            let n_u32 = self.n as u32;
+            let m_u32 = self.m as u32;
             let cfg = LaunchConfig {
                 grid_dim: (
-                    ((self.n as u32) + tile - 1) / tile,
-                    ((self.m as u32) + tile - 1) / tile,
+                    n_u32 / tile + u32::from(n_u32 % tile != 0),
+                    m_u32 / tile + u32::from(m_u32 % tile != 0),
                     1,
                 ),
                 block_dim: (tile, tile, 1),
@@ -148,9 +157,27 @@ fn gemm_nn_fp8_weight_cuda(
             let n_out = out_shape.elem_count();
             let b = sb.as_cuda_slice::<u8>()?.slice(lb.start_offset()..);
 
-            if self.out_bf16 {
-                let a = sa.as_cuda_slice::<half::bf16>()?.slice(la.start_offset()..);
-                let c = unsafe { dev.alloc::<half::bf16>(n_out) }.w()?;
+            match self.output_dtype {
+                DType::F16 => {
+                    let a = sa.as_cuda_slice::<half::f16>()?.slice(la.start_offset()..);
+                    let c = unsafe { dev.alloc::<half::f16>(n_out) }.w()?;
+                    let mut builder = func.builder();
+                    builder.arg(&c);
+                    builder.arg(&a);
+                    builder.arg(&b);
+                    builder.arg(&self.scale);
+                    builder.arg(&self.m);
+                    builder.arg(&self.n);
+                    builder.arg(&self.k);
+                    unsafe { builder.launch(cfg) }.w()?;
+                    Ok((
+                        candle_core::CudaStorage::wrap_cuda_slice(c, dev.clone()),
+                        out_shape,
+                    ))
+                }
+                DType::BF16 => {
+                    let a = sa.as_cuda_slice::<half::bf16>()?.slice(la.start_offset()..);
+                    let c = unsafe { dev.alloc::<half::bf16>(n_out) }.w()?;
                 let mut builder = func.builder();
                 builder.arg(&c);
                 builder.arg(&a);
@@ -164,8 +191,9 @@ fn gemm_nn_fp8_weight_cuda(
                     candle_core::CudaStorage::wrap_cuda_slice(c, dev.clone()),
                     out_shape,
                 ))
-            } else {
-                let a = sa.as_cuda_slice::<f32>()?.slice(la.start_offset()..);
+                }
+                DType::F32 => {
+                    let a = sa.as_cuda_slice::<f32>()?.slice(la.start_offset()..);
                 let c = unsafe { dev.alloc::<f32>(n_out) }.w()?;
                 let mut builder = func.builder();
                 builder.arg(&c);
@@ -176,26 +204,27 @@ fn gemm_nn_fp8_weight_cuda(
                 builder.arg(&self.n);
                 builder.arg(&self.k);
                 unsafe { builder.launch(cfg) }.w()?;
-                Ok((
-                    candle_core::CudaStorage::wrap_cuda_slice(c, dev.clone()),
-                    out_shape,
-                ))
+                    Ok((
+                        candle_core::CudaStorage::wrap_cuda_slice(c, dev.clone()),
+                        out_shape,
+                    ))
+                }
+                _ => candle_core::bail!("unsupported fp8 gemm dtype"),
             }
         }
     }
 
-    let out_bf16 = a.dtype() == DType::BF16;
-    let a_in = if out_bf16 {
-        a_c.to_dtype(DType::BF16)?
-    } else {
-        a_c.to_dtype(DType::F32)?
+    let output_dtype = a.dtype();
+    let a_in = match output_dtype {
+        DType::F32 | DType::F16 | DType::BF16 => a_c.to_dtype(output_dtype)?,
+        _ => candle_core::bail!("unsupported fp8 gemm activation dtype"),
     };
     let op = Fp8Gemm {
         scale,
         m: m as i32,
         n: n as i32,
         k: k as i32,
-        out_bf16,
+        output_dtype,
     };
     a_in.apply_op2_no_bwd(&b_c, &op)
 }
