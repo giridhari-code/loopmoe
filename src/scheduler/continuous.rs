@@ -1,4 +1,4 @@
-//! Continuous batching scheduler — optimized + borrow-safe
+//! Continuous batching scheduler — O3: chunked prefill + Tesla lane
 
 use super::block_manager::{AllocStatus, BlockManager};
 use super::sequence::{Sequence, SequenceStatus};
@@ -9,6 +9,10 @@ pub struct SchedulerConfig {
     pub max_num_batched_tokens: usize,
     pub shortest_first: bool,
     pub enable_preempt: bool,
+    /// Max prompt tokens processed per seq per step (chunked prefill).
+    pub prefill_chunk_size: usize,
+    /// Default Tesla draft estimate when seq.draft_len is set but 0.
+    pub tesla_draft_estimate: usize,
 }
 
 impl Default for SchedulerConfig {
@@ -18,14 +22,28 @@ impl Default for SchedulerConfig {
             max_num_batched_tokens: 8192,
             shortest_first: true,
             enable_preempt: true,
+            prefill_chunk_size: 512,
+            tesla_draft_estimate: 5,
         }
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct PrefillChunk {
+    pub seq_id: u64,
+    /// Index into prompt tokens.
+    pub start: usize,
+    pub len: usize,
+}
+
 #[derive(Debug, Default)]
 pub struct SchedulerOutputs {
-    pub prefill_ids: Vec<u64>,
+    /// Chunked prefill work this step.
+    pub prefill_chunks: Vec<PrefillChunk>,
+    /// Plain decode (1 token budget each).
     pub decode_ids: Vec<u64>,
+    /// Tesla speculative decode (budget = draft_len).
+    pub tesla_ids: Vec<u64>,
     pub num_batched_tokens: usize,
     pub finished: Vec<u64>,
     pub preempted: Vec<u64>,
@@ -33,11 +51,16 @@ pub struct SchedulerOutputs {
 
 impl SchedulerOutputs {
     pub fn is_empty(&self) -> bool {
-        self.prefill_ids.is_empty() && self.decode_ids.is_empty()
+        self.prefill_chunks.is_empty() && self.decode_ids.is_empty() && self.tesla_ids.is_empty()
     }
 
     pub fn num_scheduled(&self) -> usize {
-        self.prefill_ids.len() + self.decode_ids.len()
+        self.prefill_chunks.len() + self.decode_ids.len() + self.tesla_ids.len()
+    }
+
+    /// Back-compat: all prefill seq ids.
+    pub fn prefill_ids(&self) -> Vec<u64> {
+        self.prefill_chunks.iter().map(|c| c.seq_id).collect()
     }
 }
 
@@ -46,7 +69,6 @@ pub struct ContinuousScheduler {
     block_manager: BlockManager,
     waiting: Vec<Sequence>,
     running: Vec<Sequence>,
-    /// Reaped this / previous schedule — still hold tokens for BatchEngine.
     finished_buf: Vec<Sequence>,
     next_id: u64,
     pub stats: SchedulerStats,
@@ -56,7 +78,9 @@ pub struct ContinuousScheduler {
 pub struct SchedulerStats {
     pub schedule_calls: u64,
     pub total_prefills_admitted: u64,
+    pub total_prefill_chunks: u64,
     pub total_decodes_scheduled: u64,
+    pub total_tesla_scheduled: u64,
     pub total_preempts: u64,
     pub total_finished: u64,
 }
@@ -118,15 +142,50 @@ impl ContinuousScheduler {
     }
 
     #[inline]
-    fn decode_token_estimate(seq: &Sequence) -> usize {
-        seq.draft_len.unwrap_or(1).max(1)
+    fn chunk_size(&self) -> usize {
+        self.cfg.prefill_chunk_size.max(1)
+    }
+
+    /// Tokens remaining in prompt not yet computed.
+    #[inline]
+    fn prefill_remaining(seq: &Sequence) -> usize {
+        seq.prompt_len.saturating_sub(seq.num_computed_tokens)
+    }
+
+    #[inline]
+    fn prefill_chunk_for(seq: &Sequence, chunk_size: usize) -> PrefillChunk {
+        let start = seq.num_computed_tokens.min(seq.prompt_len);
+        let rem = seq.prompt_len.saturating_sub(start);
+        let len = rem.min(chunk_size).max(if rem > 0 { 1 } else { 0 });
+        PrefillChunk {
+            seq_id: seq.id,
+            start,
+            len,
+        }
+    }
+
+    #[inline]
+    fn is_tesla(seq: &Sequence) -> bool {
+        seq.draft_len.map(|d| d > 0).unwrap_or(false)
+    }
+
+    #[inline]
+    fn decode_token_estimate(&self, seq: &Sequence) -> usize {
+        if Self::is_tesla(seq) {
+            seq.draft_len
+                .unwrap_or(self.cfg.tesla_draft_estimate)
+                .max(1)
+        } else {
+            1
+        }
     }
 
     pub fn schedule(&mut self) -> SchedulerOutputs {
         self.stats.schedule_calls += 1;
         let mut out = SchedulerOutputs::default();
+        let chunk_size = self.chunk_size();
 
-        // ── 1. Reap finished → finished_buf (keep tokens) ─────────────────
+        // ── 1. Reap finished ──────────────────────────────────────────────
         let mut still = Vec::with_capacity(self.running.len());
         for seq in self.running.drain(..) {
             if seq.is_finished() {
@@ -143,62 +202,82 @@ impl ContinuousScheduler {
         let max_seqs = self.cfg.max_num_seqs;
         let max_tok = self.cfg.max_num_batched_tokens;
         let mut num_tokens = 0usize;
+        let mut scheduled_ids: Vec<u64> = Vec::new();
 
-        // ── 2. Decode candidates (no live mut borrow across preempt) ──────
-        let mut decode_candidates: Vec<(u64, usize, usize)> = Vec::new();
+        // ── 2. Decode + Tesla (running, prompt done) ─────────────────────
+        let mut candidates: Vec<(u64, usize, usize, bool)> = Vec::new();
+        // (id, est, extra_blocks, is_tesla)
         for seq in &self.running {
             if seq.is_prompt() {
                 continue;
             }
-            let est = Self::decode_token_estimate(seq);
+            let est = self.decode_token_estimate(seq);
             let need = self
                 .block_manager
                 .blocks_for_tokens(seq.len() + est)
                 .saturating_sub(seq.block_table.len());
-            decode_candidates.push((seq.id, est, need));
+            candidates.push((seq.id, est, need, Self::is_tesla(seq)));
         }
 
-        let mut selected_decode: Vec<u64> = Vec::new();
-        for (id, est, need) in decode_candidates {
-            if selected_decode.len() >= max_seqs {
+        for (id, est, need, is_tesla) in candidates {
+            if scheduled_ids.len() >= max_seqs {
                 break;
             }
-            if num_tokens + est > max_tok && !selected_decode.is_empty() {
+            if num_tokens + est > max_tok && !scheduled_ids.is_empty() {
                 break;
             }
-            if need > 0 {
-                match self.block_manager.can_allocate(need) {
-                    AllocStatus::Ok => {
-                        if let Some(extra) = self.block_manager.allocate(need) {
-                            if let Some(seq) = self.running.iter_mut().find(|s| s.id == id) {
-                                seq.block_table.extend(extra);
-                            }
-                        } else {
-                            continue;
-                        }
-                    }
-                    AllocStatus::Later if self.cfg.enable_preempt => {
-                        if !self.preempt_one_except(id, &mut out) {
-                            continue;
-                        }
-                        if let Some(extra) = self.block_manager.allocate(need) {
-                            if let Some(seq) = self.running.iter_mut().find(|s| s.id == id) {
-                                seq.block_table.extend(extra);
-                            }
-                        } else {
-                            continue;
-                        }
-                    }
-                    _ => continue,
-                }
+            if need > 0 && !self.try_grow_blocks(id, need, &mut out) {
+                continue;
             }
-            selected_decode.push(id);
+            scheduled_ids.push(id);
             num_tokens += est;
-            self.stats.total_decodes_scheduled += 1;
+            if is_tesla {
+                out.tesla_ids.push(id);
+                self.stats.total_tesla_scheduled += 1;
+            } else {
+                out.decode_ids.push(id);
+                self.stats.total_decodes_scheduled += 1;
+            }
         }
-        out.decode_ids = selected_decode;
 
-        // ── 3. Admit prefills ─────────────────────────────────────────────
+        // ── 3. Continuing chunked prefills (already running) ─────────────
+        let mut prefill_candidates: Vec<u64> = self
+            .running
+            .iter()
+            .filter(|s| s.is_prompt() && !s.is_finished())
+            .map(|s| s.id)
+            .collect();
+
+        for id in prefill_candidates.drain(..) {
+            if scheduled_ids.len() >= max_seqs {
+                break;
+            }
+            let Some(seq) = self.running.iter().find(|s| s.id == id) else {
+                continue;
+            };
+            let chunk = Self::prefill_chunk_for(seq, chunk_size);
+            if chunk.len == 0 {
+                continue;
+            }
+            if num_tokens + chunk.len > max_tok && !scheduled_ids.is_empty() {
+                break;
+            }
+            // Ensure blocks for prompt progress
+            let need_tokens = chunk.start + chunk.len;
+            let need = self
+                .block_manager
+                .blocks_for_tokens(need_tokens)
+                .saturating_sub(seq.block_table.len());
+            if need > 0 && !self.try_grow_blocks(id, need, &mut out) {
+                continue;
+            }
+            scheduled_ids.push(id);
+            num_tokens += chunk.len;
+            out.prefill_chunks.push(chunk);
+            self.stats.total_prefill_chunks += 1;
+        }
+
+        // ── 4. Admit new waiting (first chunk only in budget) ─────────────
         if self.cfg.shortest_first && self.waiting.len() > 1 {
             self.waiting.sort_by_key(|s| s.prompt_len);
         }
@@ -207,29 +286,35 @@ impl ContinuousScheduler {
         let mut waiting_keep = Vec::with_capacity(self.waiting.len());
 
         for mut seq in self.waiting.drain(..) {
-            let slots = self.running.len() + admitted.len() + out.decode_ids.len();
+            let slots = self.running.len() + admitted.len() + scheduled_ids.len();
             if slots >= max_seqs {
                 waiting_keep.push(seq);
                 continue;
             }
-            let prompt_tokens = seq.prompt_len.max(1);
-            if num_tokens + prompt_tokens > max_tok
-                && (!out.decode_ids.is_empty() || !admitted.is_empty())
-            {
+            let first = Self::prefill_chunk_for(&seq, chunk_size);
+            let cost = first.len.max(1);
+            if num_tokens + cost > max_tok && !scheduled_ids.is_empty() {
                 waiting_keep.push(seq);
                 continue;
             }
 
-            let need = self.block_manager.blocks_for_tokens(seq.len().max(1));
+            // Allocate blocks for full prompt up front (stable block table)
+            let need = self.block_manager.blocks_for_tokens(seq.prompt_len.max(1));
             match self.block_manager.can_allocate(need) {
                 AllocStatus::Ok => {
                     if let Some(blocks) = self.block_manager.allocate(need) {
                         seq.block_table = blocks;
                         seq.status = SequenceStatus::Running;
-                        num_tokens += prompt_tokens;
-                        out.prefill_ids.push(seq.id);
+                        num_tokens += cost;
+                        scheduled_ids.push(seq.id);
+                        out.prefill_chunks.push(PrefillChunk {
+                            seq_id: seq.id,
+                            start: first.start,
+                            len: first.len,
+                        });
                         admitted.push(seq);
                         self.stats.total_prefills_admitted += 1;
+                        self.stats.total_prefill_chunks += 1;
                     } else {
                         waiting_keep.push(seq);
                     }
@@ -239,10 +324,16 @@ impl ContinuousScheduler {
                         if let Some(blocks) = self.block_manager.allocate(need) {
                             seq.block_table = blocks;
                             seq.status = SequenceStatus::Running;
-                            num_tokens += prompt_tokens;
-                            out.prefill_ids.push(seq.id);
+                            num_tokens += cost;
+                            scheduled_ids.push(seq.id);
+                            out.prefill_chunks.push(PrefillChunk {
+                                seq_id: seq.id,
+                                start: first.start,
+                                len: first.len,
+                            });
                             admitted.push(seq);
                             self.stats.total_prefills_admitted += 1;
+                            self.stats.total_prefill_chunks += 1;
                         } else {
                             waiting_keep.push(seq);
                         }
@@ -266,6 +357,35 @@ impl ContinuousScheduler {
         out
     }
 
+    fn try_grow_blocks(&mut self, id: u64, need: usize, out: &mut SchedulerOutputs) -> bool {
+        match self.block_manager.can_allocate(need) {
+            AllocStatus::Ok => {
+                if let Some(extra) = self.block_manager.allocate(need) {
+                    if let Some(seq) = self.running.iter_mut().find(|s| s.id == id) {
+                        seq.block_table.extend(extra);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            AllocStatus::Later if self.cfg.enable_preempt => {
+                if !self.preempt_one_except(id, out) {
+                    return false;
+                }
+                if let Some(extra) = self.block_manager.allocate(need) {
+                    if let Some(seq) = self.running.iter_mut().find(|s| s.id == id) {
+                        seq.block_table.extend(extra);
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        }
+    }
+
     fn preempt_one(&mut self, out: &mut SchedulerOutputs) -> bool {
         self.preempt_one_except(u64::MAX, out)
     }
@@ -286,6 +406,8 @@ impl ContinuousScheduler {
         };
         let mut seq = self.running.swap_remove(idx);
         out.decode_ids.retain(|&id| id != seq.id);
+        out.tesla_ids.retain(|&id| id != seq.id);
+        out.prefill_chunks.retain(|c| c.seq_id != seq.id);
         seq.finish(SequenceStatus::FinishedPreempted);
         self.block_manager.free_many(&seq.block_table);
         out.preempted.push(seq.id);
@@ -310,7 +432,6 @@ impl ContinuousScheduler {
             .find(|s| s.id == id)
     }
 
-    /// Drain all reaped finished sequences (tokens intact).
     pub fn drain_finished(&mut self) -> Vec<Sequence> {
         std::mem::take(&mut self.finished_buf)
     }
