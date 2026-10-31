@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "sentinel", about = "Sentinel v1.0 — Looped MoE inference (Fertile + Tesla)")]
+#[command(name = "sentinel", about = "Sentinel v1.0 — parallel Looped MoE + Tesla")]
 struct Args {
     #[arg(short, long)]
     model: String,
@@ -38,15 +38,16 @@ struct Args {
     tesla: bool,
     #[arg(long, default_value_t = 5)]
     tesla_k: usize,
-    /// Enable tree (branched) draft.
-    #[arg(long)]
+    /// Tree draft (parallel batch expand). Default on when --tesla.
+    #[arg(long, default_value_t = true)]
     tesla_tree: bool,
-    /// Tree branch width (top-w).
     #[arg(long, default_value_t = 2)]
     tesla_tree_width: usize,
-    /// Tree depth (0 = use tesla_k).
     #[arg(long, default_value_t = 0)]
     tesla_tree_depth: usize,
+    /// Force sequential chain draft instead of parallel tree.
+    #[arg(long)]
+    tesla_chain: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -86,8 +87,11 @@ fn main() -> anyhow::Result<()> {
     tracing::info!(prompt_tokens = input_ids.len(), "encoded prompt");
     let out_ids = if args.tesla {
         let mut tcfg = TeslaConfig::with_nextn(args.tesla_k);
-        if args.tesla_tree {
-            tcfg.use_tree = true;
+        if args.tesla_chain {
+            tcfg.use_tree = false;
+            tracing::info!("Tesla sequential chain draft");
+        } else {
+            tcfg.use_tree = args.tesla_tree;
             tcfg.tree_width = args.tesla_tree_width.max(1);
             tcfg.tree_depth = if args.tesla_tree_depth == 0 {
                 args.tesla_k
@@ -98,7 +102,7 @@ fn main() -> anyhow::Result<()> {
             tracing::info!(
                 width = tcfg.tree_width,
                 depth = tcfg.tree_depth,
-                "Tesla tree draft enabled"
+                "Tesla PARALLEL tree draft (batch expand)"
             );
         }
         engine.generate_tesla(&input_ids, args.max_tokens, &params, &tcfg)?

@@ -1,4 +1,4 @@
-//! Fertile dispatch — CUDA / ARM / CPU.
+//! Fertile dispatch — CUDA / ARM / CPU (parallel expert backends).
 
 use candle_core::{Result as CandleResult, Tensor};
 use candle_nn::Module;
@@ -15,7 +15,7 @@ pub struct FertileMoeParams {
     pub use_sigmoid: bool,
 }
 
-pub trait FertileExpert {
+pub trait FertileExpert: Sync {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor>;
 }
 

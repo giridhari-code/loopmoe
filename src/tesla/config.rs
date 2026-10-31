@@ -15,7 +15,7 @@ pub struct TeslaConfig {
     pub greedy_draft: bool,
     /// Prefer margin-aware scheduling when true.
     pub use_margin: bool,
-    /// Enable tree (branched) draft instead of single chain.
+    /// Enable tree (branched) draft — parallel level expand.
     pub use_tree: bool,
     /// Branching factor at each tree node (top-w tokens).
     pub tree_width: usize,
@@ -35,7 +35,8 @@ impl Default for TeslaConfig {
             min_margin: 0.05,
             greedy_draft: true,
             use_margin: true,
-            use_tree: false,
+            // Parallel-first defaults
+            use_tree: true,
             tree_width: 2,
             tree_depth: 0,
             use_dobu_fuse: true,
@@ -54,6 +55,8 @@ impl TeslaConfig {
     pub fn with_nextn(n: usize) -> Self {
         Self {
             max_draft: n.max(1),
+            use_tree: true,
+            tree_depth: n.max(1),
             ..Default::default()
         }
     }

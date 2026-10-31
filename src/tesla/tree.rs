@@ -1,17 +1,17 @@
-//! Tree draft — branched speculative candidates ranked by survival.
+//! Tree draft — **parallel** level-synchronous expand.
 //!
-//! At each depth we expand the top-`width` tokens from the current node,
-//! keep a beam of paths, and select the best path (highest survival product)
-//! for chunk verify.
+//! At each depth all beam nodes advance in **one batched forward** (batch matmul),
+//! not sequential per-node KV replay.
 
 use candle_core::{Device, IndexOp, Result as CResult, Tensor, D};
 use crate::model::LoopedMoE;
 use crate::cache::RuntimeCaches;
-use crate::sampler::{sample_token, SamplingParams};
+use crate::sampler::SamplingParams;
 use super::confidence::{position_confidence, position_confidence_margin};
 use super::config::TeslaConfig;
 use super::fuse::topk_last_ids;
 use rand::Rng;
+use rayon::prelude::*;
 
 #[derive(Debug, Clone)]
 pub struct TreePath {
@@ -27,138 +27,129 @@ struct BeamNode {
     confidences: Vec<f32>,
     margins: Vec<f32>,
     survival: f32,
-    /// Last token fed to the model for this node.
     last_token: u32,
-    pos: usize,
 }
 
-fn squeeze(logits: &Tensor) -> CResult<Tensor> {
-    match logits.dims() {
-        [_] => Ok(logits.clone()),
-        [1, _] => logits.squeeze(0),
-        [1, 1, _] => logits.squeeze(0)?.squeeze(0),
-        d if d.len() == 2 => logits.i(0),
-        _ => logits.flatten_all(),
-    }
-}
-
-/// Expand a draft tree and return the best path by survival product.
+/// Parallel tree draft: batch all beam last-tokens → one forward → branch top-w.
+/// Draft scoring uses `caches: None` so the batch path is pure parallel GEMM/attention
+//! without sequential KV restore/replay. Verify still uses real KV.
 pub fn draft_tree(
     model: &LoopedMoE,
-    caches: &mut RuntimeCaches,
+    _caches: &mut RuntimeCaches,
     start_token: u32,
     start_pos: usize,
     device: &Device,
     cfg: &TeslaConfig,
-    params: &SamplingParams,
-    generated: &[u32],
-    rng: &mut impl Rng,
+    _params: &SamplingParams,
+    _generated: &[u32],
+    _rng: &mut impl Rng,
 ) -> CResult<TreePath> {
     let depth = cfg.tree_depth_or_default();
     let width = cfg.tree_width.max(1);
-    let lens_root = caches.checkpoint_lens();
 
-    // Root beam: one node at the current position (no tokens yet).
     let mut beam = vec![BeamNode {
         tokens: Vec::new(),
         confidences: Vec::new(),
         margins: Vec::new(),
         survival: 1.0,
         last_token: start_token,
-        pos: start_pos,
     }];
 
-    let draft_params = if cfg.greedy_draft {
-        SamplingParams::greedy()
-    } else {
-        params.clone()
-    };
+    for d in 0..depth {
+        let b = beam.len();
+        if b == 0 {
+            break;
+        }
 
-    for _d in 0..depth {
-        let mut next_beam: Vec<BeamNode> = Vec::new();
+        // ---- Parallel batch forward: (B, 1) tokens in one call ----
+        let batch_toks: Vec<u32> = beam.iter().map(|n| n.last_token).collect();
+        let input = Tensor::new(batch_toks.as_slice(), device)?.reshape((b, 1))?;
+        // start_pos + d approximates position for RoPE when cache is unused
+        let logits = model.forward(&input, start_pos + d, None)?; // (B, V) expected
 
-        for node in &beam {
-            // Restore to root then replay this path so each branch has correct KV.
-            caches.restore_lens(&lens_root);
-            let mut pos = start_pos;
-            let mut tok = start_token;
-            for &t in &node.tokens {
-                let input = Tensor::new(&[tok], device)?.unsqueeze(0)?;
-                let _ = model.forward(&input, pos, Some(caches))?;
-                tok = t;
-                pos += 1;
-            }
-            // Forward from node's last state
-            let input = Tensor::new(&[node.last_token], device)?.unsqueeze(0)?;
-            let logits = squeeze(&model.forward(&input, node.pos, Some(caches))?)?;
+        let logits_2d = match logits.dims() {
+            [bb, v] if *bb == b => logits.clone(),
+            [1, bb, v] if *bb == b => logits.squeeze(0)?,
+            [bb, 1, v] if *bb == b => logits.squeeze(1)?,
+            _ => logits.flatten_all()?.reshape((b, ()))?,
+        };
 
-            let conf = position_confidence(&logits).unwrap_or(0.0);
-            let margin = if cfg.use_margin {
-                position_confidence_margin(&logits).unwrap_or(0.0)
-            } else {
-                0.0
-            };
+        // Parallel host expand of branches from each beam row
+        let width = width;
+        let use_margin = cfg.use_margin;
+        let min_conf = cfg.min_confidence;
+        let min_surv = cfg.min_survival;
 
-            // Branch: top-w tokens
-            let k = width.min(logits.dims1().unwrap_or(width).max(1));
-            let (_vals, ids) = topk_last_ids(&logits.unsqueeze(0)?, k)?;
-            // ids shape (1, k)
-            let id_vec = ids.squeeze(0)?.to_vec1::<u32>().or_else(|_| {
-                ids.squeeze(0)?.to_dtype(candle_core::DType::U32)?.to_vec1::<u32>()
-            })?;
-
-            for &cand in &id_vec {
-                // If not greedy, optionally mix in a sample for diversity
-                let chosen = if cfg.greedy_draft {
-                    cand
-                } else if id_vec.len() == 1 {
-                    sample_token(&logits, &draft_params, generated, rng)?
+        let row_results: Vec<CResult<Vec<BeamNode>>> = (0..b)
+            .into_par_iter()
+            .map(|i| {
+                let node = &beam[i];
+                let row = logits_2d.i(i)?;
+                let conf = position_confidence(&row).unwrap_or(0.0);
+                let margin = if use_margin {
+                    position_confidence_margin(&row).unwrap_or(0.0)
                 } else {
-                    cand
+                    0.0
                 };
 
-                let mut tokens = node.tokens.clone();
-                tokens.push(chosen);
-                let mut confidences = node.confidences.clone();
-                confidences.push(conf);
-                let mut margins = node.margins.clone();
-                margins.push(margin);
-                let survival = node.survival * conf.clamp(1e-6, 1.0);
+                let k = width;
+                let row_b = row.unsqueeze(0)?;
+                let (_vals, ids) = topk_last_ids(&row_b, k)?;
+                let id_tensor = ids.squeeze(0)?;
+                let id_vec = id_tensor.to_vec1::<u32>().or_else(|_| {
+                    id_tensor
+                        .to_dtype(candle_core::DType::U32)?
+                        .to_vec1::<u32>()
+                })?;
 
-                if conf < cfg.min_confidence || survival < cfg.min_survival {
-                    // Still keep short paths; ranking will prefer better ones
+                let mut kids = Vec::with_capacity(id_vec.len());
+                for &cand in &id_vec {
+                    let survival = node.survival * conf.clamp(1e-6, 1.0);
+                    if conf < min_conf && !node.tokens.is_empty() {
+                        continue;
+                    }
+                    if survival < min_surv && !node.tokens.is_empty() {
+                        continue;
+                    }
+                    let mut tokens = node.tokens.clone();
+                    tokens.push(cand);
+                    let mut confidences = node.confidences.clone();
+                    confidences.push(conf);
+                    let mut margins = node.margins.clone();
+                    margins.push(margin);
+                    kids.push(BeamNode {
+                        tokens,
+                        confidences,
+                        margins,
+                        survival,
+                        last_token: cand,
+                    });
                 }
+                Ok(kids)
+            })
+            .collect();
 
-                next_beam.push(BeamNode {
-                    tokens,
-                    confidences,
-                    margins,
-                    survival,
-                    last_token: chosen,
-                    pos: node.pos + 1,
-                });
-            }
+        let mut next_beam = Vec::new();
+        for r in row_results {
+            next_beam.extend(r?);
         }
 
         if next_beam.is_empty() {
             break;
         }
 
-        // Keep top beams by survival (beam width = width for memory control)
-        next_beam.sort_by(|a, b| {
+        // Parallel sort by survival, keep top beams
+        next_beam.par_sort_by(|a, b| {
             b.survival
                 .partial_cmp(&a.survival)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-        next_beam.truncate(width.max(1) * 2); // allow slight expansion then prune
+        let keep = (width * 2).max(width);
+        next_beam.truncate(keep);
         beam = next_beam;
     }
 
-    // Restore root cache for caller (verify will restore again itself)
-    caches.restore_lens(&lens_root);
-
-    // Best path
-    beam.sort_by(|a, b| {
+    beam.par_sort_by(|a, b| {
         b.survival
             .partial_cmp(&a.survival)
             .unwrap_or(std::cmp::Ordering::Equal)

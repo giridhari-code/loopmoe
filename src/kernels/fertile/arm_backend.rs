@@ -1,12 +1,13 @@
-//! Fertile ARM/CPU backend — same DeviceGroupPlan path.
+//! Fertile ARM/CPU backend — same plan, **parallel** expert map.
 
 use candle_core::{DType, Result as CandleResult, Tensor};
 use candle_nn::Module;
+use rayon::prelude::*;
 
 use super::dispatch::{FertileExpert, FertileMoeParams};
 use super::group_plan::{device_scatter_add, topk_last, DeviceGroupPlan};
 
-pub fn fertile_moe_arm<E: FertileExpert>(
+pub fn fertile_moe_arm<E: FertileExpert + Sync>(
     x_flat: &Tensor,
     gate: &impl Module,
     routed: &[E],
@@ -54,12 +55,28 @@ pub fn fertile_moe_arm<E: FertileExpert>(
         params.routed_scaling_factor,
     )?;
 
+    let active: Vec<usize> = (0..plan.n_experts)
+        .filter(|&e| plan.expert_offsets[e + 1] > plan.expert_offsets[e])
+        .collect();
+
+    let partials: Vec<CandleResult<(Tensor, Tensor)>> = active
+        .par_iter()
+        .map(|&e| {
+            let indices = plan
+                .tokens_for(e)?
+                .ok_or_else(|| candle_core::Error::Msg(format!("missing indices {e}")))?;
+            let w = plan
+                .weights_for(e, dtype)?
+                .ok_or_else(|| candle_core::Error::Msg(format!("missing weights {e}")))?;
+            let selected = x_flat.index_select(&indices, 0)?;
+            let y = routed[e].forward(&selected)?.broadcast_mul(&w)?;
+            Ok((indices, y))
+        })
+        .collect();
+
     let mut routed_acc = Tensor::zeros((t, h), dtype, device)?;
-    for e in 0..plan.n_experts {
-        let Some(indices) = plan.tokens_for(e)? else { continue };
-        let Some(w) = plan.weights_for(e, dtype)? else { continue };
-        let selected = x_flat.index_select(&indices, 0)?;
-        let y = routed[e].forward(&selected)?.broadcast_mul(&w)?;
+    for p in partials {
+        let (indices, y) = p?;
         routed_acc = device_scatter_add(&routed_acc, &indices, &y)?;
     }
 
