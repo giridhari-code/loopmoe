@@ -10,6 +10,7 @@ use crate::{
         draft_tokens, schedule_verify_len, schedule_verify_len_smart,
         verify_and_accept, TeslaConfig, TeslaStepStats,
     },
+    parallel::{DeviceMesh, ExpertParallelPlan, ParallelConfig},
     Result,
 };
 use rand::{rngs::StdRng, SeedableRng};
@@ -18,15 +19,36 @@ pub struct InferenceEngine {
     pub model: LoopedMoE,
     pub device: Device,
     pub config: ModelConfig,
+    pub mesh: DeviceMesh,
+    pub ep_plan: ExpertParallelPlan,
     dtype: DType,
 }
 
 impl InferenceEngine {
     pub fn from_safetensors<P: AsRef<Path>>(model_path: P, config: ModelConfig) -> Result<Self> {
-        let device = select_device()?;
-        tracing::info!("Using device: {:?}", device);
-        let backend = BackendInfo::from_device(&device);
+        Self::from_safetensors_parallel(model_path, config, ParallelConfig::single())
+    }
+
+    pub fn from_safetensors_parallel<P: AsRef<Path>>(
+        model_path: P,
+        config: ModelConfig,
+        parallel: ParallelConfig,
+    ) -> Result<Self> {
+        parallel.validate()?;
+        let device = DeviceMesh::select_device(parallel.local_rank)?;
+        let mesh = DeviceMesh::from_config(parallel, device.clone())?;
+        tracing::info!(
+            device = ?mesh.device(),
+            world = mesh.config.world_size,
+            tp = mesh.config.tp_size,
+            ep = mesh.config.ep_size,
+            dp = mesh.config.dp_size,
+            kind = ?mesh.config.kind(),
+            "Device mesh"
+        );
+        let backend = BackendInfo::from_device(mesh.device());
         tracing::info!(fertile_backend = %backend.kind, "Fertile kernel backend");
+
         let dtype = DType::BF16;
         let weights_path = model_path.as_ref();
         let vb = if weights_path.is_dir() {
@@ -34,7 +56,7 @@ impl InferenceEngine {
                 candle_nn::VarBuilder::from_mmaped_safetensors(
                     &[weights_path.join("model.safetensors")],
                     dtype,
-                    &device,
+                    mesh.device(),
                 )?
             }
         } else {
@@ -42,11 +64,33 @@ impl InferenceEngine {
                 candle_nn::VarBuilder::from_mmaped_safetensors(
                     &[weights_path.to_path_buf()],
                     dtype,
-                    &device,
+                    mesh.device(),
                 )?
             }
         };
-        let model = LoopedMoE::load(vb, &config, &device)?;
+        let model = LoopedMoE::load(vb, &config, mesh.device())?;
+
+        let ep_plan = if mesh.is_single() {
+            ExpertParallelPlan::single(
+                config.n_routed_experts,
+                config.n_shared_experts,
+                config.num_experts_per_tok,
+            )
+        } else {
+            ExpertParallelPlan::from_mesh(
+                &mesh,
+                config.n_routed_experts,
+                config.n_shared_experts,
+                config.num_experts_per_tok,
+            )?
+        };
+        tracing::info!(
+            ep_rank = ep_plan.shard.ep_rank,
+            local_experts = ep_plan.local_routed_count(),
+            shared = ep_plan.n_shared_experts,
+            "Expert parallel plan"
+        );
+
         let kv_est = kv_bytes_estimate(
             config.num_layers,
             1,
@@ -60,10 +104,13 @@ impl InferenceEngine {
             kv_cache_mib = kv_est / (1024 * 1024),
             "RAM plan"
         );
+
         Ok(Self {
             model,
-            device,
+            device: mesh.device().clone(),
             config,
+            mesh,
+            ep_plan,
             dtype,
         })
     }
@@ -250,12 +297,4 @@ fn squeeze_logits(logits: &Tensor) -> candle_core::Result<Tensor> {
         dims if dims.len() == 2 => logits.i(0),
         _ => logits.flatten_all(),
     }
-}
-
-fn select_device() -> Result<Device> {
-    if let Ok(device) = Device::new_cuda(0) {
-        return Ok(device);
-    }
-    tracing::warn!("CUDA not available, falling back to CPU/ARM");
-    Ok(Device::Cpu)
 }
