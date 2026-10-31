@@ -1,43 +1,106 @@
-# Sentinel v1.0
+# loopmoe
 
-Looped MoE + Fertile + **Tesla** + DoBu + **parallel-first** design + multi-GPU mesh + training.
+High-performance MoE + Looped Transformer inference framework in pure Rust.  
+GPU-first (CUDA) with CPU fallback. Safetensors support.
 
-## Parallel (default) — not sequential
+> **Professional structure** (inspired by production inference engines)
 
-| Component | Parallel behaviour |
-|-----------|-------------------|
-| **Tesla tree draft** | Level-sync **batch forward** (all beam tokens in one matmul) + rayon branch expand |
-| **Fertile MoE** | Active experts mapped **in parallel** (rayon); scatter reduce |
-| **Chunk verify** | One sequence forward (not N token steps) |
-| **DoBu GEMM** | Fused linear / QK / AV through DoBu |
-| **Multi-GPU** | EP/TP/DP mesh + DeepEP-style all-to-all stubs |
-
-Sequential chain draft only if you pass `--tesla-chain`.
-
-```bash
-# Parallel tree (default with --tesla)
-cargo run --release --bin sentinel -- --model ./weights --prompt "Hi" --tesla --tesla-k 4
-
-# Explicit tree width/depth
-cargo run --release --bin sentinel -- --model ./weights --prompt "Hi" \
-  --tesla --tesla-tree-width 3 --tesla-tree-depth 4
-
-# Force old sequential chain
-cargo run --release --bin sentinel -- --model ./weights --prompt "Hi" --tesla --tesla-chain
+```
+loopmoe/
+├── Cargo.toml
+├── src/
+│   ├── main.rs                    # server bootstrap
+│   ├── lib.rs
+│   ├── config.rs                  # ModelConfig, ServerConfig
+│   ├── error.rs                   # unified Error enum
+│   │
+│   ├── server/
+│   │   ├── mod.rs
+│   │   ├── routes.rs              # /v1/completions, /v1/chat/completions
+│   │   ├── openai_types.rs        # request/response structs
+│   │   ├── sse.rs                 # streaming
+│   │   └── middleware.rs          # auth, rate-limit, logging
+│   │
+│   ├── scheduler/
+│   │   ├── mod.rs
+│   │   ├── continuous.rs          # continuous batching scheduler
+│   │   ├── sequence.rs            # Sequence { id, tokens, state, ... }
+│   │   └── block_manager.rs       # paged KV-cache block allocator
+│   │
+│   ├── engine/
+│   │   ├── mod.rs
+│   │   ├── executor.rs            # runs forward pass on batch
+│   │   ├── sampler.rs             # top-k, top-p, temperature, repetition penalty
+│   │   ├── stop_criteria.rs       # EOS, max_tokens, stop strings
+│   │   └── metrics.rs             # tokens/sec, latency, queue depth
+│   │
+│   ├── model/
+│   │   ├── mod.rs
+│   │   ├── loader.rs              # safetensors → weights
+│   │   ├── llama.rs               # Llama architecture
+│   │   ├── qwen.rs                # Qwen architecture
+│   │   ├── attention.rs           # PagedAttention kernel launcher
+│   │   ├── mlp.rs                 # SwiGLU
+│   │   ├── rope.rs                # rotary embeddings
+│   │   └── quantization.rs        # FP8/INT8/AWQ loaders
+│   │
+│   ├── kernels/                   # CUDA kernels (Rust bindings)
+│   │   ├── mod.rs
+│   │   ├── paged_attention.rs
+│   │   ├── rmsnorm.rs
+│   │   ├── rope.rs
+│   │   ├── silu_mul.rs
+│   │   ├── gemm_fp8.rs
+│   │   └── cuda/
+│   │       ├── mod.rs
+│   │       ├── build.rs
+│   │       ├── paged_attention.cu
+│   │       ├── rmsnorm.cu
+│   │       ├── rope.cu
+│   │       ├── silu_mul.cu
+│   │       └── gemm_fp8.cu
+│   │
+│   └── utils/
+│       ├── mod.rs
+│       ├── tokenizer.rs
+│       └── logger.rs
+│
+├── tests/
+│   ├── integration_server.rs
+│   ├── test_scheduler.rs
+│   └── test_kv_cache.rs
+│
+├── benches/
+│   └── throughput.rs
+│
+├── examples/
+│   ├── simple_completion.rs
+│   └── chat_stream.rs
+│
+├── Dockerfile
+├── README.md
+└── config/
+    └── default.toml
 ```
 
-## Multi-GPU
+## Status
+
+- **Scaffold complete** on branch `professional-structure`
+- Existing specialized code (Looped-MoE, Tesla, Fertile, DoBu, training, recipe) is still present and will be gradually migrated into the new modules.
+- New modules are currently placeholders ready for implementation.
+
+## Quick start (legacy)
 
 ```bash
-export WORLD_SIZE=8 RANK=0 LOCAL_RANK=0 EP_SIZE=8 TP_SIZE=1
+cargo run --release --bin sentinel -- --model ./weights --prompt "Hi" --tesla
 ```
 
-`ParallelConfig` / `DeviceMesh` / `ExpertParallelPlan` / `AllToAllStub` — wire DeepEP for real collectives.
+## Server (when wired)
 
-## DoBu
+```bash
+cargo run --release --bin sentinel-server --features server
+```
 
-DeepGEMM-style GEMM + FlashMLA-style MLA. Tesla `fuse_*` calls DoBu.
+## License
 
-## Training
-
-See TRAINING.md.
+Apache-2.0
