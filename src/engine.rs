@@ -73,10 +73,11 @@ impl InferenceEngine {
         let model = LoopedMoE::load(vb, &config, mesh.device())?;
 
         let ep_plan = if mesh.is_single() {
-            ExpertParallelPlan::single(
+            ExpertParallelPlan::single_with_capacity(
                 config.n_routed_experts,
                 config.n_shared_experts,
                 config.num_experts_per_tok,
+                config.capacity_factor,
             )
         } else {
             ExpertParallelPlan::from_mesh(
