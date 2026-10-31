@@ -50,6 +50,15 @@ pub struct ExpertParallelPlan {
 impl ExpertParallelPlan {
     /// Build plan for single-GPU (owns all experts).
     pub fn single(n_routed: usize, n_shared: usize, top_k: usize) -> Self {
+        Self::single_with_capacity(n_routed, n_shared, top_k, 1.25)
+    }
+
+    pub fn single_with_capacity(
+        n_routed: usize,
+        n_shared: usize,
+        top_k: usize,
+        capacity_factor: f32,
+    ) -> Self {
         Self {
             n_routed_experts: n_routed,
             n_shared_experts: n_shared,
@@ -62,7 +71,7 @@ impl ExpertParallelPlan {
                 ep_size: 1,
             },
             shared_replicated: true,
-            capacity_factor: 1.25,
+            capacity_factor,
         }
     }
 
@@ -76,7 +85,6 @@ impl ExpertParallelPlan {
         let ep = mesh.config.ep_size.max(1);
         let ep_rank = mesh.rank_info.ep_rank;
         if n_routed % ep != 0 {
-            // Uneven last shard allowed; prefer even for balance.
             tracing::warn!(
                 n_routed,
                 ep,
@@ -113,7 +121,6 @@ impl ExpertParallelPlan {
     }
 
     /// Recommended local capacity for this rank given global token count.
-    /// Used by future real dispatch to size receive buffers.
     pub fn local_capacity(&self, global_tokens: usize) -> usize {
         if self.shard.count == 0 || self.capacity_factor <= 0.0 {
             return usize::MAX;
