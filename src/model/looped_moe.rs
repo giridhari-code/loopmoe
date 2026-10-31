@@ -2,6 +2,7 @@ use candle_core::{Device, Result as CandleResult, Tensor};
 use candle_nn::{Module, VarBuilder};
 use crate::config::ModelConfig;
 use crate::cache::RuntimeCaches;
+use super::traits::InferModel;
 use super::{RmsNorm, TransformerBlock, rope::RotaryEmbedding};
 
 pub struct LoopedMoE {
@@ -47,6 +48,14 @@ impl LoopedMoE {
         } else {
             candle_nn::linear(config.hidden_size, config.vocab_size, vb.pp("lm_head"))?
         };
+        tracing::info!(
+            layers = config.num_layers,
+            loop_count = config.loop_count,
+            depth = config.num_layers * config.loop_count,
+            mla = config.use_mla,
+            experts = config.n_routed_experts,
+            "LoopedMoE loaded"
+        );
         Ok(Self {
             config: config.clone(),
             embed_tokens,
@@ -95,12 +104,22 @@ impl LoopedMoE {
         self.lm_head.forward(&hidden)
     }
 
-    /// O2.1: one decode step for `B` sequences in a single call.
-    ///
-    /// - `tokens.len() == positions.len() == caches.len() == B`
-    /// - Returns logits `[B, vocab]`
-    /// - Batched: embed, RMSNorm, residual, MoE, final norm, lm_head
-    /// - Per-seq: attention + KV/MLA cache (different RoPE positions)
+    /// O3 helper: run a prompt slice `[start_pos, start_pos + tokens)` into cache.
+    /// Returns last-position logits (sample only when this is the final chunk).
+    pub fn forward_prefill_chunk(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        caches: &mut RuntimeCaches,
+    ) -> CandleResult<Tensor> {
+        if tokens.is_empty() {
+            candle_core::bail!("forward_prefill_chunk: empty tokens");
+        }
+        let input = Tensor::new(tokens, &self.device)?.reshape((1, tokens.len()))?;
+        self.forward(&input, start_pos, Some(caches))
+    }
+
+    /// O2.1: one decode step for `B` sequences → logits `[B, vocab]`.
     pub fn forward_decode_batch(
         &self,
         tokens: &[u32],
@@ -120,21 +139,18 @@ impl LoopedMoE {
             );
         }
 
-        // Fast path: single seq → existing forward
         if b == 1 {
             let input = Tensor::new(tokens, &self.device)?.reshape((1, 1))?;
             let logits = self.forward(&input, positions[0], Some(caches[0]))?;
-            // logits may be [vocab] or [1, vocab]
             return match logits.dims() {
                 [_] => logits.unsqueeze(0),
                 [1, _] => Ok(logits),
-                _ => logits.reshape((1, logits.elem_count() / 1)),
+                _ => logits.reshape((1, logits.elem_count())),
             };
         }
 
-        // Batched embed [B, 1]
         let input = Tensor::new(tokens, &self.device)?.reshape((b, 1))?;
-        let mut hidden = self.embed_tokens.forward(&input)?; // [B, 1, H]
+        let mut hidden = self.embed_tokens.forward(&input)?;
 
         let num_loops = self.config.loop_count;
         for loop_idx in 0..num_loops {
@@ -150,8 +166,36 @@ impl LoopedMoE {
             }
         }
 
-        let hidden = self.norm.forward(&hidden)?; // [B, 1, H]
-        let hidden = hidden.squeeze(1)?; // [B, H]
-        self.lm_head.forward(&hidden) // [B, vocab]
+        let hidden = self.norm.forward(&hidden)?;
+        let hidden = hidden.squeeze(1)?;
+        self.lm_head.forward(&hidden)
+    }
+}
+
+impl InferModel for LoopedMoE {
+    fn config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    fn device(&self) -> &Device {
+        &self.device
+    }
+
+    fn forward(
+        &self,
+        input_ids: &Tensor,
+        start_pos: usize,
+        caches: Option<&mut RuntimeCaches>,
+    ) -> CandleResult<Tensor> {
+        LoopedMoE::forward(self, input_ids, start_pos, caches)
+    }
+
+    fn forward_decode_batch(
+        &self,
+        tokens: &[u32],
+        positions: &[usize],
+        caches: &mut [&mut RuntimeCaches],
+    ) -> CandleResult<Tensor> {
+        LoopedMoE::forward_decode_batch(self, tokens, positions, caches)
     }
 }
