@@ -1,48 +1,42 @@
 # Orbit architecture
 
 Orbit is **loopmoe’s native** continuous-batch inference runtime.
-It is not a wrapper around any external serving engine.
 
 ## Managers
 
-| Manager | Role |
-|---------|------|
-| **OrbitSched** | Time — which sequences run, token budget, Tesla lane |
-| **BlockLedger** | Space — physical pages, block tables, slot_mapping |
-| **Pulse** (O2) | Execute — packed forward + sample |
+| Manager | Role | Phase |
+|---------|------|-------|
+| **OrbitSched** | Time — who runs this step | O1 |
+| **BlockLedger** | Space — physical pages, slot_mapping | O1 |
+| **Pulse** | Execute — PackedBatch → forward → sample | **O2** |
 
-## O1 — BlockLedger
+## O2 — PackedBatch + Pulse
 
 ```rust
-use loopmoe::{BlockLedger, LedgerConfig, CacheKind};
+use loopmoe::{PackedBatch, Pulse, PackRole, PackItem};
 
-let mut ledger = BlockLedger::new(LedgerConfig {
-    num_pages: 2048,
-    block_size: 16,
-    kind: CacheKind::Mla, // or Gqa
-    ..Default::default()
-});
-
-ledger.register_seq(1);
-assert!(ledger.ensure_tokens(1, 128));
-let slot = ledger.append_token_slot(1); // physical slot for next decode token
-let map = ledger.build_slot_mapping(&[(1, 0, 128)]);
+let pack = PackedBatch { items: vec![/* decode + prefill */], .. };
+let pulse = Pulse::new(&model, &device);
+let out = pulse.run(&pack, &mut caches, &mut generated, &mut rngs, &sampling)?;
+// out.new_tokens: seq_id → tokens this step
 ```
 
-- Pages are **1-based** ids; free list is a stack.
-- `SlotMapping.physical_slots` is what a paged-attention kernel indexes.
-- Per-seq `RuntimeCaches` still hold tensors today; O2 binds a shared pool.
+**Today:** one `model.forward` per `PackItem` (each seq has batch=1 KV/MLA cache).
+**Next (O2.1):** shared page pool + `forward_packed` for true B>1 decode.
 
-## O2 preview
+`BatchEngine::step` already:
+1. `schedule()`
+2. builds `PackedBatch` + ledger `SlotMapping`
+3. runs `Pulse` for plain prefill/decode
+4. Tesla path remains specialized per-seq
 
-`Pulse::step` will:
+## Layout
 
-1. Take `SchedulerOutputs` + `SlotMapping`
-2. Build `PackedBatch` (decode B>1)
-3. One `model.forward_packed`
-4. Sample + `ledger.append_token_slot`
-
-## Integration
-
-`OrbitSched` wraps `ContinuousScheduler` and keeps BlockLedger in sync on
-admit / decode growth / finish / preempt.
+```
+src/orbit/
+├── ledger.rs   # O1 BlockLedger
+├── sched.rs    # OrbitSched
+├── pack.rs     # O2 PackedBatch
+├── pulse.rs    # O2 Pulse
+└── core.rs     # OrbitCore helper
+```

@@ -1,16 +1,7 @@
 //! loopmoe / Sentinel — high-performance Looped-MoE inference runtime
 //!
-//! Core runtime is **Orbit**: continuous batching + physical BlockLedger (O1),
-//! Tesla speculative decode, Fertile/DoBu kernels.
-//!
-//! Modules:
-//! - `orbit`       BlockLedger · OrbitSched · (Pulse O2+)
-//! - `scheduler`   continuous batch queues (used by OrbitSched)
-//! - `engine`      InferenceEngine + BatchEngine
-//! - `model`       LoopedMoE
-//! - `kernels`     Fertile / DoBu / CUDA
-//! - `tesla`       MTP / tree speculative
-//! - `server`      OpenAI HTTP (feature `server`)
+//! Core runtime is **Orbit**: continuous batching + BlockLedger (O1) +
+//! PackedBatch/Pulse (O2), Tesla speculative decode, Fertile/DoBu kernels.
 
 pub mod config;
 pub mod error;
@@ -53,7 +44,9 @@ pub use parallel::{
 };
 pub use scheduler::{ContinuousScheduler, SchedulerConfig, Sequence, SequenceStatus};
 pub use orbit::{
-    BlockLedger, CacheKind, LedgerConfig, LedgerStats, OrbitSched, SeqBlockTable, SlotMapping,
+    BlockLedger, CacheKind, LedgerConfig, LedgerStats, OrbitCore, OrbitMetrics, OrbitSched,
+    PackItem, PackResolve, PackRole, PackedBatch, Pulse, PulseMetrics, PulseOutput, SeqBlockTable,
+    SlotMapping,
 };
 
 pub type Result<T> = anyhow::Result<T>;

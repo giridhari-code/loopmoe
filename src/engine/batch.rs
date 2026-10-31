@@ -1,13 +1,18 @@
-//! BatchEngine — continuous scheduler + InferenceEngine step loop (optimized).
+//! BatchEngine — continuous scheduler + Orbit Pulse (O2) step loop.
 
 use std::collections::HashMap;
 
-use candle_core::{Tensor, DType};
+use candle_core::DType;
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::cache::{LayerCaches, MlaCaches, RuntimeCaches};
 use crate::engine::inference::InferenceEngine;
-use crate::sampler::{is_stop, sample_token, SamplingParams};
+use crate::orbit::{
+    pack::{PackItem, PackRole, PackedBatch},
+    pulse::Pulse,
+    BlockLedger, LedgerConfig, CacheKind,
+};
+use crate::sampler::{is_stop, SamplingParams};
 use crate::scheduler::{
     ContinuousScheduler, SchedulerConfig, Sequence, SequenceStatus,
 };
@@ -30,11 +35,14 @@ pub struct BatchMetrics {
     pub tokens_generated: u64,
     pub finished: u64,
     pub preempted: u64,
+    pub pulse_decode_forwards: u64,
+    pub pulse_prefill_forwards: u64,
 }
 
 pub struct BatchEngine {
     engine: InferenceEngine,
     scheduler: ContinuousScheduler,
+    ledger: Option<BlockLedger>,
     tesla: Option<TeslaConfig>,
     runtimes: HashMap<u64, SeqRuntime>,
     pub results: HashMap<u64, Vec<u32>>,
@@ -50,9 +58,24 @@ impl BatchEngine {
         block_size: usize,
         tesla: Option<TeslaConfig>,
     ) -> Self {
+        let ledger_cfg = LedgerConfig {
+            num_pages: num_gpu_blocks.max(1),
+            block_size: block_size.max(1),
+            kind: if engine.config.use_mla {
+                CacheKind::Mla
+            } else {
+                CacheKind::Gqa
+            },
+            num_layers: engine.config.num_layers,
+            num_kv_heads: engine.config.num_key_value_heads,
+            head_dim: engine.config.head_dim,
+            kv_lora_rank: engine.config.kv_lora_rank,
+            rope_dim: engine.config.qk_rope_head_dim,
+        };
         Self {
             engine,
             scheduler: ContinuousScheduler::new(sched_cfg, num_gpu_blocks, block_size),
+            ledger: Some(BlockLedger::new(ledger_cfg)),
             tesla,
             runtimes: HashMap::new(),
             results: HashMap::new(),
@@ -67,6 +90,10 @@ impl BatchEngine {
 
     pub fn scheduler_mut(&mut self) -> &mut ContinuousScheduler {
         &mut self.scheduler
+    }
+
+    pub fn ledger(&self) -> Option<&BlockLedger> {
+        self.ledger.as_ref()
     }
 
     pub fn engine(&self) -> &InferenceEngine {
@@ -92,6 +119,13 @@ impl BatchEngine {
             }
         }
         let id = self.scheduler.add_sequence(seq);
+
+        if let Some(led) = self.ledger.as_mut() {
+            led.register_seq(id);
+            if let Some(s) = self.scheduler.get(id) {
+                let _ = led.ensure_tokens(id, s.prompt_len.max(1));
+            }
+        }
 
         let capacity = {
             let s = self.scheduler.get(id).unwrap();
@@ -144,37 +178,211 @@ impl BatchEngine {
         let outputs = self.scheduler.schedule();
         self.metrics.preempted += outputs.preempted.len() as u64;
 
-        let prefill_ids = outputs.prefill_ids;
-        let decode_ids = outputs.decode_ids;
-
-        for &id in &prefill_ids {
-            if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
-                continue;
+        // Ledger sync
+        if let Some(led) = self.ledger.as_mut() {
+            for &id in outputs.finished.iter().chain(outputs.preempted.iter()) {
+                led.free_seq(id);
             }
-            self.run_prefill(id)?;
-            self.metrics.prefills += 1;
+            for &id in outputs.decode_ids.iter().chain(outputs.prefill_ids.iter()) {
+                if let Some(s) = self.scheduler.get(id) {
+                    let need = if outputs.prefill_ids.contains(&id) {
+                        s.prompt_len.max(1)
+                    } else {
+                        s.len() + s.draft_len.unwrap_or(1)
+                    };
+                    let _ = led.ensure_tokens(id, need);
+                }
+            }
         }
 
         let use_tesla = self.tesla.as_ref().map(|t| t.enabled).unwrap_or(false);
-        for &id in &decode_ids {
+
+        // Build PackedBatch for non-Tesla paths
+        let mut prefill_items = Vec::new();
+        let mut decode_items = Vec::new();
+        for &id in &outputs.prefill_ids {
+            if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
+                continue;
+            }
+            if let Some(seq) = self.scheduler.get(id) {
+                prefill_items.push(PackItem {
+                    seq_id: id,
+                    role: PackRole::Prefill,
+                    token_ids: seq.tokens[..seq.prompt_len].to_vec(),
+                    position: 0,
+                });
+            }
+        }
+        for &id in &outputs.decode_ids {
             if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
                 continue;
             }
             if self.scheduler.get(id).map(|s| s.is_prompt()).unwrap_or(false) {
-                self.run_prefill(id)?;
-                self.metrics.prefills += 1;
+                if let Some(seq) = self.scheduler.get(id) {
+                    prefill_items.push(PackItem {
+                        seq_id: id,
+                        role: PackRole::Prefill,
+                        token_ids: seq.tokens[..seq.prompt_len].to_vec(),
+                        position: 0,
+                    });
+                }
                 continue;
             }
             if use_tesla {
-                self.run_decode_tesla(id)?;
-                self.metrics.tesla_steps += 1;
-            } else {
-                self.run_decode_plain(id)?;
+                continue; // Tesla handled separately
             }
-            self.metrics.decodes += 1;
+            if let Some(seq) = self.scheduler.get(id) {
+                let last = *seq.tokens.last().unwrap_or(&0);
+                let pos = self
+                    .runtimes
+                    .get(&id)
+                    .map(|r| r.caches.current_len())
+                    .unwrap_or(0);
+                decode_items.push(PackItem {
+                    seq_id: id,
+                    role: PackRole::Decode,
+                    token_ids: vec![last],
+                    position: pos,
+                });
+            }
         }
 
-        // Move any seqs that finished during this step into finished_buf
+        let slots = if let Some(led) = self.ledger.as_ref() {
+            let mut ranges = Vec::new();
+            for it in prefill_items.iter().chain(decode_items.iter()) {
+                ranges.push((it.seq_id, it.position, it.token_ids.len()));
+            }
+            led.build_slot_mapping(&ranges)
+        } else {
+            Default::default()
+        };
+
+        let pack = PackedBatch {
+            num_prefill: prefill_items.len(),
+            num_decode: decode_items.len(),
+            num_tokens: prefill_items
+                .iter()
+                .chain(decode_items.iter())
+                .map(|i| i.token_ids.len())
+                .sum(),
+            items: {
+                let mut v = prefill_items;
+                v.extend(decode_items);
+                v
+            },
+            slots,
+        };
+
+        // Pulse for plain prefill + decode
+        if !pack.is_empty() {
+            let mut caches_map = HashMap::new();
+            let mut gen_map = HashMap::new();
+            let mut rng_map = HashMap::new();
+            let mut samp_map = HashMap::new();
+
+            for item in &pack.items {
+                if let Some(rt) = self.runtimes.remove(&item.seq_id) {
+                    gen_map.insert(item.seq_id, rt.generated);
+                    rng_map.insert(item.seq_id, rt.rng);
+                    caches_map.insert(item.seq_id, rt.caches);
+                }
+                if let Some(seq) = self.scheduler.get(item.seq_id) {
+                    samp_map.insert(item.seq_id, seq.sampling.clone());
+                }
+            }
+
+            let pulse = Pulse::new(&self.engine.model, &self.engine.device);
+            let pout = pulse.run(&pack, &mut caches_map, &mut gen_map, &mut rng_map, &samp_map)?;
+            self.metrics.pulse_decode_forwards += pout.metrics.decode_forwards;
+            self.metrics.pulse_prefill_forwards += pout.metrics.prefill_forwards;
+
+            for (id, new_toks) in pout.new_tokens {
+                for &t in &new_toks {
+                    self.metrics.tokens_generated += 1;
+                    if let Some(seq) = self.scheduler.get_mut(id) {
+                        let is_prefill = pack
+                            .items
+                            .iter()
+                            .any(|i| i.seq_id == id && i.role == PackRole::Prefill);
+                        if is_prefill {
+                            seq.append_token(t);
+                            seq.mark_computed(seq.prompt_len);
+                            self.metrics.prefills += 1;
+                        } else {
+                            seq.append_token(t);
+                            seq.mark_computed(1);
+                            self.metrics.decodes += 1;
+                        }
+                        let max_tokens = seq.stop.max_tokens;
+                        let sampling = seq.sampling.clone();
+                        if is_stop(t, &sampling) || seq.generated_len() >= max_tokens {
+                            let status = if seq.generated_len() >= max_tokens {
+                                SequenceStatus::FinishedLengthCapped
+                            } else {
+                                SequenceStatus::FinishedStopped
+                            };
+                            seq.finish(status);
+                        }
+                    }
+                    if let Some(led) = self.ledger.as_mut() {
+                        let _ = led.append_token_slot(id);
+                    }
+                }
+                // restore runtime
+                if let (Some(caches), Some(generated), Some(rng)) = (
+                    caches_map.remove(&id),
+                    gen_map.remove(&id),
+                    rng_map.remove(&id),
+                ) {
+                    self.runtimes.insert(
+                        id,
+                        SeqRuntime {
+                            caches,
+                            mtp: self
+                                .runtimes
+                                .remove(&id)
+                                .map(|r| r.mtp)
+                                .unwrap_or_default(),
+                            generated,
+                            rng,
+                        },
+                    );
+                }
+            }
+            // restore any left
+            for (id, caches) in caches_map {
+                let generated = gen_map.remove(&id).unwrap_or_default();
+                let rng = rng_map
+                    .remove(&id)
+                    .unwrap_or_else(|| StdRng::seed_from_u64(id));
+                self.runtimes.insert(
+                    id,
+                    SeqRuntime {
+                        caches,
+                        mtp: MtpState::default(),
+                        generated,
+                        rng,
+                    },
+                );
+            }
+        }
+
+        // Tesla decode path (still per-seq)
+        if use_tesla {
+            for &id in &outputs.decode_ids {
+                if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
+                    continue;
+                }
+                if self.scheduler.get(id).map(|s| s.is_prompt()).unwrap_or(false) {
+                    continue;
+                }
+                self.run_decode_tesla(id)?;
+                self.metrics.tesla_steps += 1;
+                self.metrics.decodes += 1;
+            }
+        }
+
+        // Finish reap
         let newly_done: Vec<u64> = self
             .scheduler
             .running_ids()
@@ -187,25 +395,18 @@ impl BatchEngine {
             })
             .collect();
         for id in newly_done {
-            if let Some(pos) = self
-                .scheduler
-                .running_ids()
-                .iter()
-                .position(|_| true)
-            {
-                let _ = pos;
-            }
-            // Use finish_sequence to move into finished_buf (status already set)
             if let Some(seq) = self.scheduler.get(id) {
                 let status = seq.status;
                 self.scheduler.finish_sequence(id, status);
             }
         }
 
-        // Drain finished_buf → results
         let mut done = Vec::new();
         for seq in self.scheduler.drain_finished() {
             let id = seq.id;
+            if let Some(led) = self.ledger.as_mut() {
+                led.free_seq(id);
+            }
             self.results.insert(id, seq.tokens);
             self.runtimes.remove(&id);
             self.metrics.finished += 1;
@@ -218,7 +419,6 @@ impl BatchEngine {
         while self.has_unfinished() {
             let _ = self.step()?;
         }
-        // Final drain in case anything left in buf
         for seq in self.scheduler.drain_finished() {
             self.results.insert(seq.id, seq.tokens);
             self.runtimes.remove(&seq.id);
@@ -227,9 +427,10 @@ impl BatchEngine {
             steps = self.metrics.steps,
             prefills = self.metrics.prefills,
             decodes = self.metrics.decodes,
+            pulse_dec = self.metrics.pulse_decode_forwards,
+            pulse_pref = self.metrics.pulse_prefill_forwards,
             tesla = self.metrics.tesla_steps,
             finished = self.metrics.finished,
-            preempted = self.metrics.preempted,
             tokens = self.metrics.tokens_generated,
             "BatchEngine done"
         );
@@ -245,82 +446,6 @@ impl BatchEngine {
 
     pub fn mtp_stats(&self, id: u64) -> Option<&MtpState> {
         self.runtimes.get(&id).map(|r| &r.mtp)
-    }
-
-    fn run_prefill(&mut self, id: u64) -> Result<()> {
-        let (prompt, sampling, max_tokens, prompt_len) = {
-            let seq = self
-                .scheduler
-                .get(id)
-                .ok_or_else(|| anyhow::anyhow!("missing seq {id}"))?;
-            (
-                seq.tokens[..seq.prompt_len].to_vec(),
-                seq.sampling.clone(),
-                seq.stop.max_tokens,
-                seq.prompt_len,
-            )
-        };
-
-        let rt = self
-            .runtimes
-            .get_mut(&id)
-            .ok_or_else(|| anyhow::anyhow!("missing runtime {id}"))?;
-
-        let device = &self.engine.device;
-        let prefill = Tensor::new(prompt.as_slice(), device)?.unsqueeze(0)?;
-        let logits = squeeze_logits(&self.engine.model.forward(
-            &prefill,
-            0,
-            Some(&mut rt.caches),
-        )?)?;
-        let next = sample_token(&logits, &sampling, &rt.generated, &mut rt.rng)?;
-        rt.generated.push(next);
-        self.metrics.tokens_generated += 1;
-
-        if let Some(seq) = self.scheduler.get_mut(id) {
-            seq.append_token(next);
-            seq.mark_computed(prompt_len);
-            if is_stop(next, &sampling) || seq.generated_len() >= max_tokens {
-                seq.finish(finish_status(seq.generated_len(), max_tokens, next, &sampling));
-            }
-        }
-        Ok(())
-    }
-
-    fn run_decode_plain(&mut self, id: u64) -> Result<()> {
-        let (sampling, max_tokens, last_token) = {
-            let seq = self
-                .scheduler
-                .get(id)
-                .ok_or_else(|| anyhow::anyhow!("missing seq {id}"))?;
-            let last = *seq.tokens.last().unwrap_or(&0);
-            (seq.sampling.clone(), seq.stop.max_tokens, last)
-        };
-
-        let rt = self
-            .runtimes
-            .get_mut(&id)
-            .ok_or_else(|| anyhow::anyhow!("missing runtime {id}"))?;
-        let device = &self.engine.device;
-        let pos = rt.caches.current_len();
-        let input = Tensor::new(&[last_token], device)?.unsqueeze(0)?;
-        let logits = squeeze_logits(&self.engine.model.forward(
-            &input,
-            pos,
-            Some(&mut rt.caches),
-        )?)?;
-        let next = sample_token(&logits, &sampling, &rt.generated, &mut rt.rng)?;
-        rt.generated.push(next);
-        self.metrics.tokens_generated += 1;
-
-        if let Some(seq) = self.scheduler.get_mut(id) {
-            seq.append_token(next);
-            seq.mark_computed(1);
-            if is_stop(next, &sampling) || seq.generated_len() >= max_tokens {
-                seq.finish(finish_status(seq.generated_len(), max_tokens, next, &sampling));
-            }
-        }
-        Ok(())
     }
 
     fn run_decode_tesla(&mut self, id: u64) -> Result<()> {
@@ -386,41 +511,22 @@ impl BatchEngine {
         for &t in &accepted {
             rt.generated.push(t);
             self.metrics.tokens_generated += 1;
+            if let Some(led) = self.ledger.as_mut() {
+                let _ = led.append_token_slot(id);
+            }
             if let Some(seq) = self.scheduler.get_mut(id) {
                 seq.append_token(t);
                 seq.mark_computed(1);
                 if is_stop(t, &sampling) || seq.generated_len() >= max_tokens {
-                    seq.finish(finish_status(seq.generated_len(), max_tokens, t, &sampling));
+                    seq.finish(if seq.generated_len() >= max_tokens {
+                        SequenceStatus::FinishedLengthCapped
+                    } else {
+                        SequenceStatus::FinishedStopped
+                    });
                     break;
                 }
             }
         }
         Ok(())
-    }
-}
-
-fn finish_status(
-    generated_len: usize,
-    max_tokens: usize,
-    last: u32,
-    sampling: &SamplingParams,
-) -> SequenceStatus {
-    if generated_len >= max_tokens {
-        SequenceStatus::FinishedLengthCapped
-    } else if is_stop(last, sampling) {
-        SequenceStatus::FinishedStopped
-    } else {
-        SequenceStatus::FinishedStopped
-    }
-}
-
-fn squeeze_logits(logits: &Tensor) -> candle_core::Result<Tensor> {
-    use candle_core::IndexOp;
-    match logits.dims() {
-        [_] => Ok(logits.clone()),
-        [1, _] => logits.squeeze(0),
-        [1, 1, _] => logits.squeeze(0)?.squeeze(0),
-        dims if dims.len() == 2 => logits.i(0),
-        _ => logits.flatten_all(),
     }
 }
