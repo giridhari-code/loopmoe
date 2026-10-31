@@ -4,6 +4,7 @@
 //! Excess tokens beyond per-expert capacity are dropped (highest-score kept).
 
 use candle_core::{DType, Result as CandleResult, Tensor, D};
+use std::cmp::Ordering;
 
 /// Per-forward load statistics for monitoring imbalance + drops.
 #[derive(Debug, Clone, Default)]
@@ -153,7 +154,10 @@ impl DeviceGroupPlan {
         for (e, mut list) in per_expert.into_iter().enumerate() {
             if list.len() > capacity {
                 // Keep highest weight (DeepSeek / Switch style)
-                list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                list.sort_by(|a, b| match b.1.partial_cmp(&a.1) {
+                    Some(o) => o,
+                    None => Ordering::Less,
+                });
                 dropped += list.len() - capacity;
                 list.truncate(capacity);
             }
