@@ -259,6 +259,9 @@ fn float_to_fp8_e4m3_host(x: f32) -> u8 {
         return 0x7F;
     }
     let sign = if x < 0.0 { 1u8 } else { 0u8 };
+    if x.is_infinite() {
+        return (sign << 7) | 0x7E;
+    }
     let mut x = x.abs();
     if x == 0.0 {
         return sign << 7;
@@ -266,14 +269,18 @@ fn float_to_fp8_e4m3_host(x: f32) -> u8 {
     if x > 448.0 {
         x = 448.0;
     }
-    // frexp
-    let exp_f = x.log2().floor();
-    let mut exp = exp_f as i32;
-    let mut frac = x / 2f32.powi(exp); // [1, 2) roughly
-    if frac < 1.0 {
-        frac *= 2.0;
+    // Use an exact binary exponent; log2().floor() can round below a power of two.
+    let mut y = x;
+    let mut exp = 0;
+    while y >= 2.0 {
+        y *= 0.5;
+        exp += 1;
+    }
+    while y < 1.0 {
+        y *= 2.0;
         exp -= 1;
     }
+    let mut frac = y;
     let mut e = exp + 7;
     if e <= 0 {
         let den = x * 512.0;
@@ -296,4 +303,28 @@ fn float_to_fp8_e4m3_host(x: f32) -> u8 {
 
 pub fn fp8_supported() -> bool {
     fp8_ready()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{float_to_fp8_e4m3_host, fp8_e4m3_to_float_host};
+
+    #[test]
+    fn fp8_powers_of_two_encode_exactly() {
+        for value in [0.00390625f32, 0.25, 1.0, 2.0, 16.0, 128.0] {
+            let encoded = float_to_fp8_e4m3_host(value);
+            assert_eq!(fp8_e4m3_to_float_host(encoded), value);
+            assert_eq!(
+                fp8_e4m3_to_float_host(float_to_fp8_e4m3_host(-value)),
+                -value
+            );
+        }
+    }
+
+    #[test]
+    fn fp8_special_values_match_device_encoding() {
+        assert_eq!(float_to_fp8_e4m3_host(f32::INFINITY), 0x7E);
+        assert_eq!(float_to_fp8_e4m3_host(f32::NEG_INFINITY), 0xFE);
+        assert_eq!(float_to_fp8_e4m3_host(f32::NAN), 0x7F);
+    }
 }
