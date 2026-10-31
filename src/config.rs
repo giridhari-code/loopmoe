@@ -26,6 +26,12 @@ pub struct ModelConfig {
     pub norm_topk_prob: bool,
     pub topk_method: String,
 
+    /// Capacity factor for MoE load balancing (DeepSeek / Switch style).
+    /// Tokens beyond capacity_factor * (tokens*top_k / n_experts) are dropped.
+    /// <= 0.0 disables capacity limiting. Typical range: 1.0 – 1.5.
+    #[serde(default = "default_capacity_factor")]
+    pub capacity_factor: f32,
+
     pub max_position_embeddings: usize,
     pub max_seq_len: usize,
     pub rope_theta: f32,
@@ -56,6 +62,7 @@ fn d_kv_lora() -> usize { 512 }
 fn d_nope() -> usize { 128 }
 fn d_rope() -> usize { 64 }
 fn d_vdim() -> usize { 128 }
+fn default_capacity_factor() -> f32 { 1.25 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
@@ -81,6 +88,7 @@ impl Default for ModelConfig {
             scoring_func: "softmax".to_string(),
             norm_topk_prob: true,
             topk_method: "greedy".to_string(),
+            capacity_factor: 1.25,
 
             max_position_embeddings: 131_072,
             max_seq_len: 4096,
