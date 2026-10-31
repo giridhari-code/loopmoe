@@ -4,7 +4,7 @@ use candle_core::{DType, Result as CandleResult, Tensor};
 use candle_nn::Module;
 
 use super::dispatch::{FertileExpert, FertileMoeParams};
-use super::group_plan::{device_scatter_add, DeviceGroupPlan};
+use super::group_plan::{device_scatter_add, topk_last, DeviceGroupPlan};
 
 pub fn fertile_moe_cuda<E: FertileExpert>(
     x_flat: &Tensor,
@@ -35,7 +35,7 @@ pub fn fertile_moe_cuda<E: FertileExpert>(
         logits
     };
 
-    let (mut topk_w, topk_ids) = scores.topk(params.num_experts_per_tok)?;
+    let (mut topk_w, topk_ids) = topk_last(&scores, params.num_experts_per_tok)?;
     let topk_ids = topk_ids.to_dtype(DType::I64)?;
 
     topk_w = if params.use_sigmoid {

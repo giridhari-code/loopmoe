@@ -4,6 +4,7 @@ use loopmoe::{
     engine::InferenceEngine,
     sampler::SamplingParams,
     tokenizer::{resolve_tokenizer_path, Tokenizer},
+    tesla::TeslaConfig,
 };
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
@@ -33,6 +34,10 @@ struct Args {
     seed: Option<u64>,
     #[arg(long, value_delimiter = ',')]
     stop: Vec<u32>,
+    #[arg(long)]
+    tesla: bool,
+    #[arg(long, default_value_t = 5)]
+    tesla_k: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -67,7 +72,12 @@ fn main() -> anyhow::Result<()> {
     }
     let input_ids = tokenizer.encode(&args.prompt)?;
     tracing::info!(prompt_tokens = input_ids.len(), "encoded prompt");
-    let out_ids = engine.generate(&input_ids, args.max_tokens, &params)?;
+    let out_ids = if args.tesla {
+        let tcfg = TeslaConfig::with_nextn(args.tesla_k);
+        engine.generate_tesla(&input_ids, args.max_tokens, &params, &tcfg)?
+    } else {
+        engine.generate(&input_ids, args.max_tokens, &params)?
+    };
     let text = tokenizer.decode(&out_ids[input_ids.len()..])?;
     println!("{}", text);
     Ok(())

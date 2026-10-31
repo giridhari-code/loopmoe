@@ -70,7 +70,11 @@ impl KvCache {
     }
 
     fn grow_to(&mut self, need: usize) -> CandleResult<()> {
-        if need <= self.capacity && self.k.is_some() {
+        if self.k.is_none() {
+            if need > self.capacity { self.capacity = need; }
+            return Ok(());
+        }
+        if need <= self.capacity {
             return Ok(());
         }
         let new_cap = need.max(self.capacity.max(1) * 2).max(need);
@@ -107,12 +111,12 @@ impl KvCache {
         self.grow_to(need)?;
         self.ensure_allocated()?;
 
-        let k = self.k.as_mut().unwrap();
-        let v = self.v.as_mut().unwrap();
         let start = self.len;
         let end = start + s_new;
-        *k = slice_assign_seq(k, start, end, new_k)?;
-        *v = slice_assign_seq(v, start, end, new_v)?;
+        let k = self.k.as_ref().unwrap();
+        let v = self.v.as_ref().unwrap();
+        k.slice_set(&new_k.contiguous()?, 2, start)?;
+        v.slice_set(&new_v.contiguous()?, 2, start)?;
         self.len = end;
         Ok(())
     }
@@ -135,6 +139,11 @@ impl KvCache {
         self.len = 0;
     }
 
+    /// Rewind to an earlier length (stale entries get overwritten on next append).
+    pub fn set_len(&mut self, len: usize) {
+        self.len = len.min(self.capacity);
+    }
+
     pub fn release(&mut self) {
         self.k = None;
         self.v = None;
@@ -142,19 +151,7 @@ impl KvCache {
     }
 }
 
-fn slice_assign_seq(buf: &Tensor, start: usize, end: usize, src: &Tensor) -> CandleResult<Tensor> {
-    let (_b, _h, cap, _d) = buf.dims4()?;
-    let mut parts: Vec<Tensor> = Vec::with_capacity(3);
-    if start > 0 {
-        parts.push(buf.narrow(2, 0, start)?);
-    }
-    parts.push(src.clone());
-    if end < cap {
-        parts.push(buf.narrow(2, end, cap - end)?);
-    }
-    Tensor::cat(&parts, 2)
-}
-
+#[derive(Debug)]
 pub struct LayerCaches {
     pub layers: Vec<KvCache>,
     pub capacity: usize,
@@ -203,6 +200,16 @@ impl LayerCaches {
     pub fn current_len(&self) -> usize {
         self.layers.first().map(|c| c.seq_len()).unwrap_or(0)
     }
+
+    pub fn checkpoint_lens(&self) -> Vec<usize> {
+        self.layers.iter().map(|c| c.seq_len()).collect()
+    }
+
+    pub fn restore_lens(&mut self, lens: &[usize]) {
+        for (c, &l) in self.layers.iter_mut().zip(lens) {
+            c.set_len(l);
+        }
+    }
 }
 
 pub fn kv_bytes_estimate(
@@ -214,4 +221,94 @@ pub fn kv_bytes_estimate(
     bytes_per_elem: usize,
 ) -> usize {
     num_layers * 2 * batch * num_kv_heads * head_dim * seq * bytes_per_elem
+}
+
+// ---------------- MLA cache (latent c_kv + rope key) ----------------
+
+#[derive(Debug, Default)]
+pub struct MlaCache {
+    c: Option<Tensor>,    // (b, len, rank)
+    k_pe: Option<Tensor>, // (b, 1, len, rope_dim)
+    len: usize,
+}
+
+impl MlaCache {
+    pub fn new() -> Self { Self::default() }
+    pub fn seq_len(&self) -> usize { self.len }
+
+    pub fn append(&mut self, c_kv: &Tensor, k_pe: &Tensor) -> CandleResult<()> {
+        let s_new = c_kv.dim(1)?;
+        let (c, k) = match (&self.c, &self.k_pe) {
+            (Some(c0), Some(k0)) => {
+                let c0 = c0.narrow(1, 0, self.len)?;
+                let k0 = k0.narrow(2, 0, self.len)?;
+                (Tensor::cat(&[&c0, c_kv], 1)?, Tensor::cat(&[&k0, k_pe], 2)?)
+            }
+            _ => (c_kv.clone(), k_pe.clone()),
+        };
+        self.c = Some(c);
+        self.k_pe = Some(k);
+        self.len += s_new;
+        Ok(())
+    }
+
+    pub fn c_view(&self) -> CandleResult<Option<Tensor>> {
+        match &self.c { Some(c) if self.len > 0 => Ok(Some(c.narrow(1, 0, self.len)?)), _ => Ok(None) }
+    }
+
+    pub fn k_pe_view(&self) -> CandleResult<Option<Tensor>> {
+        match &self.k_pe { Some(k) if self.len > 0 => Ok(Some(k.narrow(2, 0, self.len)?)), _ => Ok(None) }
+    }
+
+    pub fn clear(&mut self) { self.c = None; self.k_pe = None; self.len = 0; }
+
+    pub fn set_len(&mut self, len: usize) { self.len = len.min(self.len); }
+}
+
+#[derive(Debug, Default)]
+pub struct MlaCaches {
+    pub layers: Vec<MlaCache>,
+}
+
+impl MlaCaches {
+    pub fn new(num_layers: usize) -> Self {
+        Self { layers: (0..num_layers).map(|_| MlaCache::new()).collect() }
+    }
+}
+
+/// Cache bank used by the model forward (GQA or MLA).
+#[derive(Debug)]
+pub enum RuntimeCaches {
+    Gqa(LayerCaches),
+    Mla(MlaCaches),
+}
+
+impl RuntimeCaches {
+    pub fn current_len(&self) -> usize {
+        match self {
+            RuntimeCaches::Gqa(b) => b.current_len(),
+            RuntimeCaches::Mla(b) => b.layers.first().map(|c| c.seq_len()).unwrap_or(0),
+        }
+    }
+
+    pub fn clear(&mut self) {
+        match self {
+            RuntimeCaches::Gqa(b) => b.clear(),
+            RuntimeCaches::Mla(b) => for c in &mut b.layers { c.clear(); },
+        }
+    }
+
+    pub fn checkpoint_lens(&self) -> Vec<usize> {
+        match self {
+            RuntimeCaches::Gqa(b) => b.checkpoint_lens(),
+            RuntimeCaches::Mla(b) => b.layers.iter().map(|c| c.seq_len()).collect(),
+        }
+    }
+
+    pub fn restore_lens(&mut self, lens: &[usize]) {
+        match self {
+            RuntimeCaches::Gqa(b) => b.restore_lens(lens),
+            RuntimeCaches::Mla(b) => for (c, &l) in b.layers.iter_mut().zip(lens) { c.set_len(l); },
+        }
+    }
 }

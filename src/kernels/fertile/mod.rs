@@ -10,6 +10,6 @@ mod arm_backend;
 
 pub use backend::{select_backend, BackendInfo, BackendKind};
 pub use dispatch::{FertileDispatch, FertileExpert, FertileMoeParams, fertile_moe};
-pub use group_plan::DeviceGroupPlan;
+pub use group_plan::{topk_last, DeviceGroupPlan};
 
 pub const KERNEL_NAME: &str = "Fertile";

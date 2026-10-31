@@ -81,8 +81,15 @@ impl MlaAttention {
         let k_pe = self.rope.forward(&kv.narrow(D::Minus1, rank, rope_d)?.unsqueeze(1)?, start_pos)?;
 
         let (c_full, k_pe_full) = if let Some(cache) = cache {
-            if update_cache { cache.append(&c_kv, &k_pe)?; }
-            (cache.c_view()?.expect("mla c"), cache.k_pe_view()?.expect("mla k_pe"))
+            if update_cache {
+                cache.append(&c_kv, &k_pe)?;
+                (cache.c_view()?.expect("mla c"), cache.k_pe_view()?.expect("mla k_pe"))
+            } else {
+                match (cache.c_view()?, cache.k_pe_view()?) {
+                    (Some(pc), Some(pk)) => (Tensor::cat(&[&pc, &c_kv], 1)?, Tensor::cat(&[&pk, &k_pe], 2)?),
+                    _ => (c_kv, k_pe),
+                }
+            }
         } else {
             (c_kv, k_pe)
         };

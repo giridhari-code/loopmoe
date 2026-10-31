@@ -1,6 +1,6 @@
 use candle_core::{Device, Result as CResult, Tensor};
 use crate::model::LoopedMoE;
-use crate::cache::LayerCaches;
+use crate::cache::RuntimeCaches;
 use crate::sampler::{sample_token, SamplingParams};
 use super::confidence::position_confidence;
 use super::config::TeslaConfig;
@@ -23,7 +23,7 @@ fn squeeze(logits: &Tensor) -> CResult<Tensor> {
 
 pub fn draft_tokens(
     model: &LoopedMoE,
-    caches: &mut LayerCaches,
+    caches: &mut RuntimeCaches,
     start_token: u32,
     start_pos: usize,
     device: &Device,

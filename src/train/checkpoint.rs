@@ -9,7 +9,7 @@ pub fn save_varmap(varmap: &VarMap, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn load_varmap(varmap: &VarMap, dir: &Path, _device: &Device) -> Result<()> {
+pub fn load_varmap(varmap: &mut VarMap, dir: &Path, _device: &Device) -> Result<()> {
     let path = if dir.is_file() { dir.to_path_buf() } else { dir.join("model.safetensors") };
     varmap.load(&path).context("load safetensors")?;
     Ok(())

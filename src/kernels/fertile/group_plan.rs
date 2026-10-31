@@ -1,6 +1,6 @@
 //! Device-side token→expert grouping for Fertile.
 
-use candle_core::{DType, Result as CandleResult, Tensor};
+use candle_core::{DType, Result as CandleResult, Tensor, D};
 
 pub struct DeviceGroupPlan {
     pub sorted_tokens: Tensor,
@@ -117,4 +117,13 @@ pub fn device_scatter_add(
         .expand((n, h))?
         .contiguous()?;
     base.scatter_add(&idx, values, 0)
+}
+
+/// Top-k along the last dim (candle-core 0.8 has no `Tensor::topk`).
+/// Returns (values, indices[u32]) sorted by descending value.
+pub fn topk_last(x: &Tensor, k: usize) -> CandleResult<(Tensor, Tensor)> {
+    let order = x.to_dtype(DType::F32)?.contiguous()?.arg_sort_last_dim(false)?;
+    let ids = order.narrow(D::Minus1, 0, k)?.contiguous()?;
+    let vals = x.contiguous()?.gather(&ids, D::Minus1)?;
+    Ok((vals, ids))
 }

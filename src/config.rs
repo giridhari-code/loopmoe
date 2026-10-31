@@ -36,7 +36,26 @@ pub struct ModelConfig {
     pub tie_word_embeddings: bool,
     pub use_sliding_window: bool,
     pub sliding_window: Option<usize>,
+
+    #[serde(default)]
+    pub use_mla: bool,
+    #[serde(default = "d_q_lora")]
+    pub q_lora_rank: usize,
+    #[serde(default = "d_kv_lora")]
+    pub kv_lora_rank: usize,
+    #[serde(default = "d_nope")]
+    pub qk_nope_head_dim: usize,
+    #[serde(default = "d_rope")]
+    pub qk_rope_head_dim: usize,
+    #[serde(default = "d_vdim")]
+    pub v_head_dim: usize,
 }
+
+fn d_q_lora() -> usize { 1536 }
+fn d_kv_lora() -> usize { 512 }
+fn d_nope() -> usize { 128 }
+fn d_rope() -> usize { 64 }
+fn d_vdim() -> usize { 128 }
 
 impl Default for ModelConfig {
     fn default() -> Self {
@@ -73,6 +92,13 @@ impl Default for ModelConfig {
             tie_word_embeddings: false,
             use_sliding_window: false,
             sliding_window: None,
+
+            use_mla: false,
+            q_lora_rank: d_q_lora(),
+            kv_lora_rank: d_kv_lora(),
+            qk_nope_head_dim: d_nope(),
+            qk_rope_head_dim: d_rope(),
+            v_head_dim: d_vdim(),
         }
     }
 }

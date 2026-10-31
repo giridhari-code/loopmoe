@@ -14,7 +14,7 @@ pub mod tesla;
 pub use config::ModelConfig;
 pub use engine::InferenceEngine;
 pub use model::{LoopedMoE, SentinelV1};
-pub use cache::{KvCache, LayerCaches};
+pub use cache::{KvCache, LayerCaches, MlaCache, MlaCaches, RuntimeCaches};
 pub use kernels::{BackendKind, KERNEL_NAME};
 pub use sampler::SamplingParams;
 pub use tokenizer::Tokenizer;
