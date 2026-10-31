@@ -11,7 +11,9 @@
 pub mod gemm;
 pub mod mla;
 
-pub use gemm::{dobu_gemm_nn, dobu_grouped_gemm, DobuGemmLayout, DobuGemmParams};
+pub use gemm::{
+    dobu_gemm, dobu_gemm_nn, dobu_grouped_gemm, DobuGemmLayout, DobuGemmParams,
+};
 pub use mla::{
     dobu_mla_prefill, dobu_mla_with_kvcache, DobuMlaMeta, DobuMlaParams, KERNEL_MLA,
 };

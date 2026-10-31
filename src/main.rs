@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "sentinel", about = "Sentinel v1.0 — Looped MoE inference (Fertile)")]
+#[command(name = "sentinel", about = "Sentinel v1.0 — Looped MoE inference (Fertile + Tesla)")]
 struct Args {
     #[arg(short, long)]
     model: String,
@@ -38,6 +38,15 @@ struct Args {
     tesla: bool,
     #[arg(long, default_value_t = 5)]
     tesla_k: usize,
+    /// Enable tree (branched) draft.
+    #[arg(long)]
+    tesla_tree: bool,
+    /// Tree branch width (top-w).
+    #[arg(long, default_value_t = 2)]
+    tesla_tree_width: usize,
+    /// Tree depth (0 = use tesla_k).
+    #[arg(long, default_value_t = 0)]
+    tesla_tree_depth: usize,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -52,7 +61,8 @@ fn main() -> anyhow::Result<()> {
     };
     tracing::info!(model = %config.model_name, loop_count = config.loop_count, "Loading Sentinel");
     let engine = InferenceEngine::from_safetensors(&args.model, config)?;
-    let tok_path = resolve_tokenizer_path(std::path::Path::new(&args.model), args.tokenizer.as_deref());
+    let tok_path =
+        resolve_tokenizer_path(std::path::Path::new(&args.model), args.tokenizer.as_deref());
     let tokenizer = if tok_path.exists() {
         Tokenizer::from_path(&tok_path)?
     } else {
@@ -68,12 +78,29 @@ fn main() -> anyhow::Result<()> {
         seed: args.seed,
     };
     if let Some(eos) = tokenizer.eos_id() {
-        if !params.stop_token_ids.contains(&eos) { params.stop_token_ids.push(eos); }
+        if !params.stop_token_ids.contains(&eos) {
+            params.stop_token_ids.push(eos);
+        }
     }
     let input_ids = tokenizer.encode(&args.prompt)?;
     tracing::info!(prompt_tokens = input_ids.len(), "encoded prompt");
     let out_ids = if args.tesla {
-        let tcfg = TeslaConfig::with_nextn(args.tesla_k);
+        let mut tcfg = TeslaConfig::with_nextn(args.tesla_k);
+        if args.tesla_tree {
+            tcfg.use_tree = true;
+            tcfg.tree_width = args.tesla_tree_width.max(1);
+            tcfg.tree_depth = if args.tesla_tree_depth == 0 {
+                args.tesla_k
+            } else {
+                args.tesla_tree_depth
+            };
+            tcfg.use_dobu_fuse = true;
+            tracing::info!(
+                width = tcfg.tree_width,
+                depth = tcfg.tree_depth,
+                "Tesla tree draft enabled"
+            );
+        }
         engine.generate_tesla(&input_ids, args.max_tokens, &params, &tcfg)?
     } else {
         engine.generate(&input_ids, args.max_tokens, &params)?
