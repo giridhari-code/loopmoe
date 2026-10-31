@@ -84,12 +84,14 @@ impl InferenceEngine {
                 config.n_routed_experts,
                 config.n_shared_experts,
                 config.num_experts_per_tok,
+                config.capacity_factor,
             )?
         };
         tracing::info!(
             ep_rank = ep_plan.shard.ep_rank,
             local_experts = ep_plan.local_routed_count(),
             shared = ep_plan.n_shared_experts,
+            capacity_factor = ep_plan.capacity_factor,
             "Expert parallel plan"
         );
 
