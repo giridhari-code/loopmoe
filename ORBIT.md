@@ -8,35 +8,34 @@ Orbit is **loopmoe’s native** continuous-batch inference runtime.
 |---------|------|-------|
 | **OrbitSched** | Time — who runs this step | O1 |
 | **BlockLedger** | Space — physical pages, slot_mapping | O1 |
-| **Pulse** | Execute — PackedBatch → forward → sample | **O2** |
+| **Pulse** | Execute — PackedBatch → forward → sample | O2 / **O2.1** |
 
-## O2 — PackedBatch + Pulse
+## O2.1 — True B>1 decode
 
 ```rust
-use loopmoe::{PackedBatch, Pulse, PackRole, PackItem};
-
-let pack = PackedBatch { items: vec![/* decode + prefill */], .. };
-let pulse = Pulse::new(&model, &device);
-let out = pulse.run(&pack, &mut caches, &mut generated, &mut rngs, &sampling)?;
-// out.new_tokens: seq_id → tokens this step
+// LoopedMoE
+let logits = model.forward_decode_batch(&tokens, &positions, &mut cache_refs)?;
+// logits: [B, vocab]
 ```
 
-**Today:** one `model.forward` per `PackItem` (each seq has batch=1 KV/MLA cache).
-**Next (O2.1):** shared page pool + `forward_packed` for true B>1 decode.
+| Op | Batched? |
+|----|----------|
+| Embed | **Yes** `[B,1]` |
+| RMSNorm / residual | **Yes** |
+| MoE (Fertile) | **Yes** (flat `B*S`) |
+| Final norm + lm_head | **Yes** `[B,H]→[B,V]` |
+| Attention + RoPE + KV/MLA cache | Per-seq (different pos/len) |
 
-`BatchEngine::step` already:
-1. `schedule()`
-2. builds `PackedBatch` + ledger `SlotMapping`
-3. runs `Pulse` for plain prefill/decode
-4. Tesla path remains specialized per-seq
+Pulse groups all `PackRole::Decode` items into one `forward_decode_batch` call.
+Prefill stays one-forward-per-seq (variable length).
 
 ## Layout
 
 ```
 src/orbit/
-├── ledger.rs   # O1 BlockLedger
-├── sched.rs    # OrbitSched
-├── pack.rs     # O2 PackedBatch
-├── pulse.rs    # O2 Pulse
-└── core.rs     # OrbitCore helper
+├── ledger.rs   # O1
+├── sched.rs
+├── pack.rs     # O2
+├── pulse.rs    # O2 + O2.1 batch decode
+└── core.rs
 ```
