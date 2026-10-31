@@ -266,5 +266,5 @@ fn float_to_fp8_e4m3_host(x: f32) -> u8 {
 }
 
 pub fn fp8_supported() -> bool {
-    fp8_ready() || SENTINEL_KERNELS_BUILT
+    fp8_ready()
 }
