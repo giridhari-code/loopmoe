@@ -1,6 +1,24 @@
 # Sentinel v1.0
 
-Looped MoE + Fertile + **Tesla** (DSpark) + DoBu kernels + recipe API + Rust training.
+Looped MoE + Fertile + **Tesla** (DSpark) + DoBu kernels + **single/multi-GPU parallel** + recipe API + Rust training.
+
+## Parallelism (single + multi GPU)
+
+| Mode | How |
+|------|-----|
+| **Single GPU** (default) | `ParallelConfig::single()` — full experts on one device |
+| **Expert Parallel** | `ep_size > 1` — experts sharded (DeepEP-style dispatch/combine stubs) |
+| **Tensor Parallel** | `tp_size > 1` — mesh ranks ready |
+| **Data Parallel** | `dp_size > 1` |
+| **Hybrid** | `tp × ep × dp == world_size` |
+
+Env (optional):
+
+```bash
+export WORLD_SIZE=8 RANK=0 LOCAL_RANK=0 EP_SIZE=8 TP_SIZE=1
+```
+
+Collectives are currently **identity stubs** so single-process runs stay correct. Wire DeepEP / NCCL behind `AllToAllStub` for real multi-GPU.
 
 ## Tesla (was DSpark)
 
@@ -11,18 +29,13 @@ cargo run --release --bin sentinel -- --model ./weights --prompt "Hi" --tesla --
 ```
 
 - Draft up to `k` tokens
-- Confidence = max-softmax (GPU-friendly, no full vocab `to_vec`)
-- Optional top-2 margin for smarter scheduling
-- Survival-product verify length
-- Verify + KV rewind (`restore_len`)
-- Stats: drafted / scheduled / accepted + acceptance rate
+- GPU-friendly confidence + optional top-2 margin
+- Survival-product verify length + KV rewind
 
 ## DoBu kernels
 
-- **GEMM** (`dobu::gemm`) — DeepGEMM-style interface (Nn / Nt / Tn, grouped MoE GEMM)
-- **MLA** (`dobu::mla`) — FlashMLA-style prefill + KV-cache decode
-
-Current backend is pure Candle (portable). Signatures are ready for a future CUDA/FFI drop-in of DeepGEMM / FlashMLA.
+- **GEMM** — DeepGEMM-style interface (Nn / Nt / Tn, grouped MoE GEMM)
+- **MLA** — FlashMLA-style prefill + KV-cache decode
 
 ## Recipe / server
 

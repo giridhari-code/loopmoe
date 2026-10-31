@@ -1,4 +1,5 @@
 //! Device-side token→expert grouping for Fertile.
+//! Optimized to keep work on device and avoid large host copies when possible.
 
 use candle_core::{DType, Result as CandleResult, Tensor, D};
 
@@ -21,6 +22,7 @@ impl DeviceGroupPlan {
         let n = t * k;
         let device = topk_ids.device();
 
+        // token index for every (token, topk) slot
         let token_ids = Tensor::arange(0u32, t as u32, device)?
             .to_dtype(DType::I64)?
             .unsqueeze(1)?
@@ -39,7 +41,7 @@ impl DeviceGroupPlan {
         let sorted_tokens = token_ids.gather(&order, 0)?;
         let sorted_weights = flat_w.gather(&order, 0)?;
 
-        let expert_offsets = segment_offsets(&sorted_experts, n_experts)?;
+        let expert_offsets = segment_offsets_fast(&sorted_experts, n_experts)?;
 
         Ok(Self {
             sorted_tokens,
@@ -70,6 +72,11 @@ impl DeviceGroupPlan {
         let w = self.sorted_weights.narrow(0, start, end - start)?;
         Ok(Some(w.to_dtype(dtype)?.unsqueeze(1)?))
     }
+
+    /// Exclusive scan of expert occupancy (useful for multi-GPU packing).
+    pub fn occupancy(&self) -> &[usize] {
+        &self.expert_offsets
+    }
 }
 
 fn argsort_i64(x: &Tensor) -> CandleResult<Tensor> {
@@ -81,6 +88,7 @@ fn argsort_i64(x: &Tensor) -> CandleResult<Tensor> {
     match x2.arg_sort_last_dim(true) {
         Ok(order) => Ok(order.flatten_all()?),
         Err(_) => {
+            // CPU fallback only when device sort is unavailable
             let v = x.flatten_all()?.to_vec1::<i64>()?;
             let mut idx: Vec<i64> = (0..v.len() as i64).collect();
             idx.sort_by_key(|&i| v[i as usize]);
@@ -89,15 +97,21 @@ fn argsort_i64(x: &Tensor) -> CandleResult<Tensor> {
     }
 }
 
-fn segment_offsets(sorted_experts: &Tensor, n_experts: usize) -> CandleResult<Vec<usize>> {
+/// Build exclusive prefix counts. Prefer a single host read of the sorted
+/// expert id vector (unavoidable for sparse segment boundaries in pure Candle).
+fn segment_offsets_fast(sorted_experts: &Tensor, n_experts: usize) -> CandleResult<Vec<usize>> {
     let ids = sorted_experts.flatten_all()?.to_vec1::<i64>()?;
+    let mut starts = vec![0usize; n_experts + 1];
+    if ids.is_empty() {
+        return Ok(starts);
+    }
+    // Single pass: count then prefix-sum
     let mut counts = vec![0usize; n_experts];
     for &e in &ids {
-        if (0..n_experts as i64).contains(&e) {
+        if e >= 0 && (e as usize) < n_experts {
             counts[e as usize] += 1;
         }
     }
-    let mut starts = vec![0usize; n_experts + 1];
     for i in 0..n_experts {
         starts[i + 1] = starts[i] + counts[i];
     }
@@ -120,8 +134,9 @@ pub fn device_scatter_add(
 }
 
 /// Top-k along the last dim (candle-core 0.8 has no `Tensor::topk`).
-/// Returns (values, indices[u32]) sorted by descending value.
+/// Returns (values, indices) sorted by descending value.
 pub fn topk_last(x: &Tensor, k: usize) -> CandleResult<(Tensor, Tensor)> {
+    let k = k.min(x.dim(D::Minus1)?);
     let order = x.to_dtype(DType::F32)?.contiguous()?.arg_sort_last_dim(false)?;
     let ids = order.narrow(D::Minus1, 0, k)?.contiguous()?;
     let vals = x.contiguous()?.gather(&ids, D::Minus1)?;
