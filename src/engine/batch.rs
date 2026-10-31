@@ -1,10 +1,10 @@
-//! BatchEngine — continuous scheduler + InferenceEngine step loop.
+//! BatchEngine — continuous scheduler + InferenceEngine step loop (optimized).
 //!
-//! Flow (DeepInfer-style):
+//! Flow:
 //! 1. `add_request` → waiting queue
-//! 2. `schedule()` → which seqs to run (prefill or decode)
-//! 3. `step()` → prefill / plain decode / Tesla MTP decode
-//! 4. finished sequences reaped, blocks freed, tokens stored in `results`
+//! 2. `schedule()` → prefill_ids + decode_ids
+//! 3. run prefills, then decodes (plain or Tesla MTP)
+//! 4. reap finished → `results`
 
 use std::collections::HashMap;
 
@@ -24,8 +24,18 @@ struct SeqRuntime {
     caches: RuntimeCaches,
     mtp: MtpState,
     generated: Vec<u32>,
-    next_token: Option<u32>,
     rng: StdRng,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct BatchMetrics {
+    pub steps: u64,
+    pub prefills: u64,
+    pub decodes: u64,
+    pub tesla_steps: u64,
+    pub tokens_generated: u64,
+    pub finished: u64,
+    pub preempted: u64,
 }
 
 pub struct BatchEngine {
@@ -33,8 +43,8 @@ pub struct BatchEngine {
     scheduler: ContinuousScheduler,
     tesla: Option<TeslaConfig>,
     runtimes: HashMap<u64, SeqRuntime>,
-    /// Completed request outputs: seq_id → full token ids (prompt + gen).
     pub results: HashMap<u64, Vec<u32>>,
+    pub metrics: BatchMetrics,
     dtype: DType,
 }
 
@@ -52,6 +62,7 @@ impl BatchEngine {
             tesla,
             runtimes: HashMap::new(),
             results: HashMap::new(),
+            metrics: BatchMetrics::default(),
             dtype: DType::BF16,
         }
     }
@@ -68,7 +79,6 @@ impl BatchEngine {
         &self.engine
     }
 
-    /// Enqueue a new generation request. Returns sequence id.
     pub fn add_request(
         &mut self,
         prompt_tokens: Vec<u32>,
@@ -83,7 +93,9 @@ impl BatchEngine {
         seq.sampling = sampling.clone();
         seq.stop.max_tokens = max_tokens;
         if let Some(ref t) = self.tesla {
-            seq.draft_len = Some(t.effective_nextn());
+            if t.enabled {
+                seq.draft_len = Some(t.effective_nextn());
+            }
         }
         let id = self.scheduler.add_sequence(seq);
 
@@ -122,8 +134,7 @@ impl BatchEngine {
             SeqRuntime {
                 caches,
                 mtp: MtpState::default(),
-                generated: Vec::new(),
-                next_token: None,
+                generated: Vec::with_capacity(max_tokens),
                 rng: StdRng::seed_from_u64(seed),
             },
         );
@@ -134,51 +145,89 @@ impl BatchEngine {
         self.scheduler.has_unfinished()
     }
 
-    /// One scheduler + execute step. Returns finished sequence ids this step.
+    /// One optimized schedule + execute step.
     pub fn step(&mut self) -> Result<Vec<u64>> {
+        self.metrics.steps += 1;
         let outputs = self.scheduler.schedule();
 
-        let scheduled = outputs.scheduled.clone();
+        // Track preempts from scheduler
+        self.metrics.preempted += outputs.preempted.len() as u64;
 
-        for &id in &scheduled {
-            let is_prompt = self
-                .scheduler
-                .get(id)
-                .map(|s| s.is_prompt())
-                .unwrap_or(false);
-            if is_prompt {
-                self.run_prefill(id)?;
-            } else {
-                self.run_decode(id)?;
+        // Snapshot prefill / decode lists (owned)
+        let prefill_ids = outputs.prefill_ids;
+        let decode_ids = outputs.decode_ids;
+        let mut finished_ids = outputs.finished;
+
+        // ── Prefills first ────────────────────────────────────────────────
+        for &id in &prefill_ids {
+            if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
+                continue;
             }
+            self.run_prefill(id)?;
+            self.metrics.prefills += 1;
         }
 
-        // Reap anything marked finished during this step
-        let mut finished = outputs.finished;
+        // ── Decodes ──────────────────────────────────────────────────────
+        let use_tesla = self.tesla.as_ref().map(|t| t.enabled).unwrap_or(false);
+        for &id in &decode_ids {
+            if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
+                continue;
+            }
+            // Skip if still needs prefill (shouldn't happen with split schedule)
+            if self.scheduler.get(id).map(|s| s.is_prompt()).unwrap_or(false) {
+                self.run_prefill(id)?;
+                self.metrics.prefills += 1;
+                continue;
+            }
+            if use_tesla {
+                self.run_decode_tesla(id)?;
+                self.metrics.tesla_steps += 1;
+            } else {
+                self.run_decode_plain(id)?;
+            }
+            self.metrics.decodes += 1;
+        }
+
+        // ── Reap anything finished this step ──────────────────────────────
         for id in self.scheduler.running_ids() {
             if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(false) {
-                finished.push(id);
+                finished_ids.push(id);
             }
         }
-        finished.sort_unstable();
-        finished.dedup();
+        // Also preempted already in finished_ids
+        finished_ids.sort_unstable();
+        finished_ids.dedup();
 
-        let mut done = Vec::new();
-        for id in finished {
+        let mut done = Vec::with_capacity(finished_ids.len());
+        for id in finished_ids {
+            // Preempted may already be removed — take_finished handles missing
             if let Some(seq) = self.scheduler.take_finished(id) {
                 self.results.insert(id, seq.tokens);
                 self.runtimes.remove(&id);
+                self.metrics.finished += 1;
+                done.push(id);
+            } else if let Some(tokens) = self.results.get(&id) {
+                let _ = tokens;
                 done.push(id);
             }
         }
         Ok(done)
     }
 
-    /// Run until all sequences finish. Returns map id → full token ids.
     pub fn run_all(&mut self) -> Result<HashMap<u64, Vec<u32>>> {
         while self.has_unfinished() {
             let _ = self.step()?;
         }
+        tracing::info!(
+            steps = self.metrics.steps,
+            prefills = self.metrics.prefills,
+            decodes = self.metrics.decodes,
+            tesla = self.metrics.tesla_steps,
+            finished = self.metrics.finished,
+            preempted = self.metrics.preempted,
+            tokens = self.metrics.tokens_generated,
+            "BatchEngine done"
+        );
         Ok(std::mem::take(&mut self.results))
     }
 
@@ -194,7 +243,7 @@ impl BatchEngine {
     }
 
     fn run_prefill(&mut self, id: u64) -> Result<()> {
-        let (prompt, sampling, max_tokens) = {
+        let (prompt, sampling, max_tokens, prompt_len) = {
             let seq = self
                 .scheduler
                 .get(id)
@@ -203,6 +252,7 @@ impl BatchEngine {
                 seq.tokens[..seq.prompt_len].to_vec(),
                 seq.sampling.clone(),
                 seq.stop.max_tokens,
+                seq.prompt_len,
             )
         };
 
@@ -220,24 +270,19 @@ impl BatchEngine {
         )?)?;
         let next = sample_token(&logits, &sampling, &rt.generated, &mut rt.rng)?;
         rt.generated.push(next);
-        rt.next_token = Some(next);
+        self.metrics.tokens_generated += 1;
 
         if let Some(seq) = self.scheduler.get_mut(id) {
             seq.append_token(next);
-            seq.mark_computed(seq.prompt_len);
+            seq.mark_computed(prompt_len);
             if is_stop(next, &sampling) || seq.generated_len() >= max_tokens {
-                seq.finish(if seq.generated_len() >= max_tokens {
-                    SequenceStatus::FinishedLengthCapped
-                } else {
-                    SequenceStatus::FinishedStopped
-                });
+                seq.finish(finish_status(seq.generated_len(), max_tokens, next, &sampling));
             }
         }
         Ok(())
     }
 
-    fn run_decode(&mut self, id: u64) -> Result<()> {
-        let tesla_cfg = self.tesla.clone();
+    fn run_decode_plain(&mut self, id: u64) -> Result<()> {
         let (sampling, max_tokens, last_token) = {
             let seq = self
                 .scheduler
@@ -247,22 +292,6 @@ impl BatchEngine {
             (seq.sampling.clone(), seq.stop.max_tokens, last)
         };
 
-        let use_tesla = tesla_cfg.as_ref().map(|t| t.enabled).unwrap_or(false);
-        if use_tesla {
-            self.run_decode_tesla(id, last_token, &sampling, max_tokens, tesla_cfg.as_ref().unwrap())?;
-        } else {
-            self.run_decode_plain(id, last_token, &sampling, max_tokens)?;
-        }
-        Ok(())
-    }
-
-    fn run_decode_plain(
-        &mut self,
-        id: u64,
-        last_token: u32,
-        sampling: &SamplingParams,
-        max_tokens: usize,
-    ) -> Result<()> {
         let rt = self
             .runtimes
             .get_mut(&id)
@@ -275,35 +304,38 @@ impl BatchEngine {
             pos,
             Some(&mut rt.caches),
         )?)?;
-        let next = sample_token(&logits, sampling, &rt.generated, &mut rt.rng)?;
+        let next = sample_token(&logits, &sampling, &rt.generated, &mut rt.rng)?;
         rt.generated.push(next);
-        rt.next_token = Some(next);
+        self.metrics.tokens_generated += 1;
 
         if let Some(seq) = self.scheduler.get_mut(id) {
             seq.append_token(next);
             seq.mark_computed(1);
-            if is_stop(next, sampling) || seq.generated_len() >= max_tokens {
-                seq.finish(if seq.generated_len() >= max_tokens {
-                    SequenceStatus::FinishedLengthCapped
-                } else {
-                    SequenceStatus::FinishedStopped
-                });
+            if is_stop(next, &sampling) || seq.generated_len() >= max_tokens {
+                seq.finish(finish_status(seq.generated_len(), max_tokens, next, &sampling));
             }
         }
         Ok(())
     }
 
-    fn run_decode_tesla(
-        &mut self,
-        id: u64,
-        last_token: u32,
-        sampling: &SamplingParams,
-        max_tokens: usize,
-        cfg: &TeslaConfig,
-    ) -> Result<()> {
-        let device = self.engine.device.clone();
-        let model = &self.engine.model;
+    fn run_decode_tesla(&mut self, id: u64) -> Result<()> {
+        // Borrow tesla config without cloning whole engine
+        let cfg = self
+            .tesla
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("tesla config missing"))?
+            .clone();
 
+        let (sampling, max_tokens, last_token) = {
+            let seq = self
+                .scheduler
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("missing seq {id}"))?;
+            let last = *seq.tokens.last().unwrap_or(&0);
+            (seq.sampling.clone(), seq.stop.max_tokens, last)
+        };
+
+        let device = self.engine.device.clone();
         let rt = self
             .runtimes
             .get_mut(&id)
@@ -313,13 +345,13 @@ impl BatchEngine {
         let lens_ckpt = rt.caches.checkpoint_lens();
 
         let draft = draft_tokens(
-            model,
+            &self.engine.model,
             &mut rt.caches,
             last_token,
             pos,
             &device,
-            cfg,
-            sampling,
+            &cfg,
+            &sampling,
             &rt.generated,
             &mut rt.rng,
         )?;
@@ -329,10 +361,9 @@ impl BatchEngine {
             draft.margins.clone(),
         );
 
-        let vlen = rt.mtp.schedule_verify_len(cfg);
-
+        let vlen = rt.mtp.schedule_verify_len(&cfg);
         let (accepted, stats) = verify_and_accept(
-            model,
+            &self.engine.model,
             &mut rt.caches,
             &lens_ckpt,
             last_token,
@@ -340,13 +371,13 @@ impl BatchEngine {
             &draft.tokens,
             vlen,
             &device,
-            sampling,
+            &sampling,
             &rt.generated,
             &mut rt.rng,
         )?;
 
         rt.mtp
-            .on_verify_result(stats.accepted, stats.scheduled, cfg);
+            .on_verify_result(stats.accepted, stats.scheduled, &cfg);
 
         tracing::debug!(
             seq = id,
@@ -360,21 +391,32 @@ impl BatchEngine {
 
         for &t in &accepted {
             rt.generated.push(t);
-            rt.next_token = Some(t);
+            self.metrics.tokens_generated += 1;
             if let Some(seq) = self.scheduler.get_mut(id) {
                 seq.append_token(t);
                 seq.mark_computed(1);
-                if is_stop(t, sampling) || seq.generated_len() >= max_tokens {
-                    seq.finish(if seq.generated_len() >= max_tokens {
-                        SequenceStatus::FinishedLengthCapped
-                    } else {
-                        SequenceStatus::FinishedStopped
-                    });
+                if is_stop(t, &sampling) || seq.generated_len() >= max_tokens {
+                    seq.finish(finish_status(seq.generated_len(), max_tokens, t, &sampling));
                     break;
                 }
             }
         }
         Ok(())
+    }
+}
+
+fn finish_status(
+    generated_len: usize,
+    max_tokens: usize,
+    last: u32,
+    sampling: &SamplingParams,
+) -> SequenceStatus {
+    if generated_len >= max_tokens {
+        SequenceStatus::FinishedLengthCapped
+    } else if is_stop(last, sampling) {
+        SequenceStatus::FinishedStopped
+    } else {
+        SequenceStatus::FinishedStopped
     }
 }
 
