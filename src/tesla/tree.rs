@@ -12,6 +12,7 @@ use super::config::TeslaConfig;
 use super::fuse::topk_last_ids;
 use rand::Rng;
 use rayon::prelude::*;
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone)]
 pub struct TreePath {
@@ -28,6 +29,14 @@ struct BeamNode {
     margins: Vec<f32>,
     survival: f32,
     last_token: u32,
+}
+
+#[inline]
+fn cmp_survival_desc(a: f32, b: f32) -> Ordering {
+    match b.partial_cmp(&a) {
+        Some(o) => o,
+        None => Ordering::Less,
+    }
 }
 
 /// Parallel tree draft: batch all beam last-tokens → one forward → branch top-w.
@@ -135,21 +144,13 @@ pub fn draft_tree(
             break;
         }
 
-        next_beam.par_sort_by(|a, b| {
-            b.survival
-                .partial_cmp(&a.survival)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        next_beam.par_sort_by(|a, b| cmp_survival_desc(a.survival, b.survival));
         let keep = (width * 2).max(width);
         next_beam.truncate(keep);
         beam = next_beam;
     }
 
-    beam.par_sort_by(|a, b| {
-        b.survival
-            .partial_cmp(&a.survival)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    beam.par_sort_by(|a, b| cmp_survival_desc(a.survival, b.survival));
 
     if let Some(best) = beam.into_iter().next() {
         Ok(TreePath {
