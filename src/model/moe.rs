@@ -31,7 +31,7 @@ impl FertileExpert for Expert {
     }
 }
 
-/// Sentinel v1.0 MoE — Fertile compute.
+/// Sentinel v1.0 MoE — Fertile compute with capacity-aware load balancing.
 pub struct MoeLayer {
     gate: Linear,
     routed_experts: Vec<Expert>,
@@ -79,6 +79,7 @@ impl MoeLayer {
             routed_scaling_factor: config.routed_scaling_factor,
             norm_topk_prob: config.norm_topk_prob,
             use_sigmoid: config.scoring_func == "sigmoid",
+            capacity_factor: config.capacity_factor,
         };
 
         tracing::debug!(
@@ -86,6 +87,7 @@ impl MoeLayer {
             kernel = KERNEL_NAME,
             routed = config.n_routed_experts,
             shared = config.n_shared_experts,
+            capacity_factor = config.capacity_factor,
             cuda_kernels = crate::kernels::cuda::kernels_built(),
             "MoE layer loaded"
         );
