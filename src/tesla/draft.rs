@@ -4,12 +4,28 @@ use crate::cache::RuntimeCaches;
 use crate::sampler::{sample_token, SamplingParams};
 use super::confidence::{position_confidence, position_confidence_margin};
 use super::config::TeslaConfig;
+use super::tree::{draft_tree, TreePath};
 use rand::Rng;
 
 pub struct DraftResult {
     pub tokens: Vec<u32>,
     pub confidences: Vec<f32>,
     pub margins: Vec<f32>,
+    /// True when this result came from tree search.
+    pub from_tree: bool,
+    pub survival: f32,
+}
+
+impl From<TreePath> for DraftResult {
+    fn from(p: TreePath) -> Self {
+        Self {
+            tokens: p.tokens,
+            confidences: p.confidences,
+            margins: p.margins,
+            from_tree: true,
+            survival: p.survival,
+        }
+    }
 }
 
 fn squeeze(logits: &Tensor) -> CResult<Tensor> {
@@ -25,7 +41,8 @@ fn squeeze(logits: &Tensor) -> CResult<Tensor> {
     }
 }
 
-pub fn draft_tokens(
+/// Linear (chain) draft — single path.
+pub fn draft_tokens_chain(
     model: &LoopedMoE,
     caches: &mut RuntimeCaches,
     start_token: u32,
@@ -41,6 +58,7 @@ pub fn draft_tokens(
     let mut margins = Vec::with_capacity(cfg.max_draft);
     let mut next = start_token;
     let mut pos = start_pos;
+    let mut survival = 1.0f32;
     let draft_params = if cfg.greedy_draft {
         SamplingParams::greedy()
     } else {
@@ -51,7 +69,9 @@ pub fn draft_tokens(
         let input = Tensor::new(&[next], device)?.unsqueeze(0)?;
         let logits = squeeze(&model.forward(&input, pos, Some(caches))?)?;
 
-        confidences.push(position_confidence(&logits)?);
+        let c = position_confidence(&logits)?;
+        confidences.push(c);
+        survival *= c.clamp(1e-6, 1.0);
         if cfg.use_margin {
             margins.push(position_confidence_margin(&logits).unwrap_or(0.0));
         } else {
@@ -67,5 +87,31 @@ pub fn draft_tokens(
         tokens,
         confidences,
         margins,
+        from_tree: false,
+        survival,
     })
+}
+
+/// Unified entry: tree or chain based on config.
+pub fn draft_tokens(
+    model: &LoopedMoE,
+    caches: &mut RuntimeCaches,
+    start_token: u32,
+    start_pos: usize,
+    device: &Device,
+    cfg: &TeslaConfig,
+    params: &SamplingParams,
+    generated: &[u32],
+    rng: &mut impl Rng,
+) -> CResult<DraftResult> {
+    if cfg.use_tree && cfg.tree_width > 1 {
+        let path = draft_tree(
+            model, caches, start_token, start_pos, device, cfg, params, generated, rng,
+        )?;
+        Ok(DraftResult::from(path))
+    } else {
+        draft_tokens_chain(
+            model, caches, start_token, start_pos, device, cfg, params, generated, rng,
+        )
+    }
 }

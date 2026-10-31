@@ -7,7 +7,7 @@ pub mod cpu;
 
 pub use fertile::{
     fertile_moe, select_backend, BackendInfo, BackendKind, DeviceGroupPlan, FertileDispatch,
-    FertileExpert, FertileMoeParams, KERNEL_NAME,
+    FertileExpert, FertileMoeParams, KERNEL_NAME, topk_last,
 };
 
 pub use dobu::{
