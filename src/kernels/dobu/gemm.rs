@@ -1,17 +1,14 @@
-//! DoBu GEMM — tiled CUDA path + Candle/cuBLAS fallback.
+//! DoBu GEMM — tiled CUDA + FP8 weight path + Candle fallback.
 
 use candle_core::{IndexOp, Result as CResult, Tensor};
-use crate::kernels::cuda::{tiled_gemm_nn, tiled_gemm_nt};
+use crate::kernels::cuda::{gemm_nn_fp8_weight, quantize_to_fp8_e4m3, tiled_gemm_nn, tiled_gemm_nt};
 
 pub const KERNEL_GEMM: &str = "DoBu-GEMM";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DobuGemmLayout {
-    /// A @ B
     Nn,
-    /// A @ Bᵀ
     Nt,
-    /// Aᵀ @ B
     Tn,
 }
 
@@ -36,14 +33,10 @@ fn matmul_layout(a: &Tensor, b: &Tensor, layout: DobuGemmLayout) -> CResult<Tens
     match layout {
         DobuGemmLayout::Nn => tiled_gemm_nn(a, b),
         DobuGemmLayout::Nt => tiled_gemm_nt(a, b),
-        DobuGemmLayout::Tn => {
-            // Aᵀ @ B — transpose A then NN tiled
-            tiled_gemm_nn(&a.t()?.contiguous()?, b)
-        }
+        DobuGemmLayout::Tn => tiled_gemm_nn(&a.t()?.contiguous()?, b),
     }
 }
 
-/// Dense GEMM with optional bias (broadcast).
 pub fn dobu_gemm_nn(
     a: &Tensor,
     b: &Tensor,
@@ -57,7 +50,6 @@ pub fn dobu_gemm_nn(
     }
 }
 
-/// Dense GEMM with alpha / beta (C = alpha * op(A) @ op(B) + beta * C).
 pub fn dobu_gemm(
     a: &Tensor,
     b: &Tensor,
@@ -76,7 +68,26 @@ pub fn dobu_gemm(
     Ok(out)
 }
 
-/// Grouped / expert GEMM used by MoE.
+/// FP8 weight-only GEMM: `activations @ dequant(fp8_weights) * scale`.
+/// `b_fp8` is U8 E4M3 storage (K, N).
+pub fn dobu_gemm_fp8(
+    activations: &Tensor,
+    b_fp8: &Tensor,
+    scale: f32,
+    bias: Option<&Tensor>,
+) -> CResult<Tensor> {
+    let out = gemm_nn_fp8_weight(activations, b_fp8, scale)?;
+    match bias {
+        Some(b) => out.broadcast_add(b),
+        None => Ok(out),
+    }
+}
+
+/// Quantize a weight matrix to FP8 E4M3 + scale (for offline pack / load).
+pub fn dobu_quantize_weight_fp8(weight: &Tensor) -> CResult<(Tensor, f32)> {
+    quantize_to_fp8_e4m3(weight)
+}
+
 pub fn dobu_grouped_gemm(
     tokens: &Tensor,
     weights: &Tensor,
@@ -100,7 +111,6 @@ pub fn dobu_grouped_gemm(
         }
         let chunk = tokens.narrow(0, start, end - start)?;
         let w = weights.i(ei)?;
-        // Prefer tiled GEMM per expert chunk
         outs.push((start, end, tiled_gemm_nn(&chunk, &w)?));
     }
 

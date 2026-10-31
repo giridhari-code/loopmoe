@@ -1,18 +1,11 @@
-//! **DoBu** — Sentinel fused compute kernels.
-//!
-//! Naming / inspiration:
-//! - DeepGEMM  → `dobu::gemm`
-//! - FlashMLA  → `dobu::mla`
-//!
-//! Current implementation is pure Candle (portable). Interfaces are shaped so
-//! that a future CUDA/FFI backend (DeepGEMM / FlashMLA) can drop in behind the
-//! same function signatures.
+//! **DoBu** — Sentinel fused compute kernels (incl. FP8).
 
 pub mod gemm;
 pub mod mla;
 
 pub use gemm::{
-    dobu_gemm, dobu_gemm_nn, dobu_grouped_gemm, DobuGemmLayout, DobuGemmParams,
+    dobu_gemm, dobu_gemm_fp8, dobu_gemm_nn, dobu_grouped_gemm, dobu_quantize_weight_fp8,
+    DobuGemmLayout, DobuGemmParams,
 };
 pub use mla::{
     dobu_mla_prefill, dobu_mla_with_kvcache, DobuMlaMeta, DobuMlaParams, KERNEL_MLA,

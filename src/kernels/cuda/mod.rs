@@ -1,14 +1,15 @@
-//! Custom CUDA kernels for Sentinel (Fertile / DoBu).
-//!
-//! Built from `sentinel.cu` via `nvcc -ptx` in `build.rs` when the `cuda`
-//! feature is on and the toolkit is available. Otherwise all ops fall back
-//! to portable Candle implementations.
+//! Custom CUDA kernels for Sentinel (Fertile / DoBu / FP8).
 
 mod ops;
 mod gemm;
+mod fp8;
 
 pub use ops::{bias_add, rmsnorm, scale_mul, scatter_add_rows, silu_mul, kernels_available};
 pub use gemm::{tiled_gemm_nn, tiled_gemm_nt, should_use_tiled};
+pub use fp8::{
+    dequant_fp8_e4m3, fp8_scale_from_amax, fp8_supported, gemm_nn_fp8_weight,
+    quantize_to_fp8_e4m3,
+};
 
 include!(concat!(env!("OUT_DIR"), "/sentinel_ptx.rs"));
 
@@ -20,4 +21,8 @@ pub fn cuda_available() -> bool {
 
 pub fn kernels_built() -> bool {
     SENTINEL_KERNELS_BUILT && !SENTINEL_PTX.is_empty()
+}
+
+pub fn fp8_kernels_built() -> bool {
+    SENTINEL_FP8_BUILT && !SENTINEL_FP8_PTX.is_empty()
 }
