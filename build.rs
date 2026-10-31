@@ -2,6 +2,17 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+fn cuda_arch_flag() -> String {
+    // Colab T4 = 7.5, A100 = 8.0, etc. Override with CUDA_COMPUTE_CAP=7.5
+    let cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "7.5".into());
+    let arch = if cap.contains('.') {
+        format!("sm_{}", cap.replace('.', ""))
+    } else {
+        format!("sm_{cap}")
+    };
+    format!("-arch={arch}")
+}
+
 fn compile_cu(cu: &PathBuf, ptx: &PathBuf, include_dir: &PathBuf) -> bool {
     let mut cmd = Command::new("nvcc");
     cmd.arg("-ptx")
@@ -9,25 +20,20 @@ fn compile_cu(cu: &PathBuf, ptx: &PathBuf, include_dir: &PathBuf) -> bool {
         .arg("-o")
         .arg(ptx)
         .arg("-O3")
-        .arg(format!("-I{}", include_dir.display()));
-    if let Ok(cap) = env::var("CUDA_COMPUTE_CAP") {
-        let arch = if cap.contains('.') {
-            format!("sm_{}", cap.replace('.', ""))
-        } else {
-            format!("sm_{cap}")
-        };
-        cmd.arg(format!("-arch={arch}"));
-    }
-    // Need bf16 types for fp8w_bf16 kernel
-    cmd.arg("--std=c++17");
+        .arg(format!("-I{}", include_dir.display()))
+        .arg("--std=c++17")
+        .arg(cuda_arch_flag());
     match cmd.status() {
         Ok(s) if s.success() => true,
         Ok(s) => {
-            println!("cargo:warning=nvcc failed for {} (status {s})", cu.display());
+            println!(
+                "cargo:warning=nvcc failed for {} (status {s}) — continuing without custom PTX",
+                cu.display()
+            );
             false
         }
         Err(e) => {
-            println!("cargo:warning=nvcc not found ({e})");
+            println!("cargo:warning=nvcc not found ({e}) — Candle CUDA still works without custom PTX");
             false
         }
     }
@@ -38,6 +44,8 @@ fn main() {
     println!("cargo:rerun-if-changed=src/kernels/cuda/fp8_kernels.cu");
     println!("cargo:rerun-if-changed=src/kernels/cuda/fp8.cuh");
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
+    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_CUDA");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let cuda_dir = PathBuf::from("src/kernels/cuda");
@@ -58,10 +66,7 @@ fn main() {
 
         let fp8_cu = cuda_dir.join("fp8_kernels.cu");
         let fp8_ptx = out_dir.join("fp8_kernels.ptx");
-        // Include cuda_bf16 for bf16 output kernel — inject include at top via -include
         if fp8_cu.exists() {
-            // Prepend cuda_bf16 by compiling with extra flag; file includes math only
-            // Rewrite: compile with -D and include path; kernel file needs bf16 header
             let mut cmd = Command::new("nvcc");
             cmd.arg("-ptx")
                 .arg(&fp8_cu)
@@ -71,15 +76,8 @@ fn main() {
                 .arg(format!("-I{}", cuda_dir.display()))
                 .arg("--std=c++17")
                 .arg("-include")
-                .arg("cuda_bf16.h");
-            if let Ok(cap) = env::var("CUDA_COMPUTE_CAP") {
-                let arch = if cap.contains('.') {
-                    format!("sm_{}", cap.replace('.', ""))
-                } else {
-                    format!("sm_{cap}")
-                };
-                cmd.arg(format!("-arch={arch}"));
-            }
+                .arg("cuda_bf16.h")
+                .arg(cuda_arch_flag());
             match cmd.status() {
                 Ok(s) if s.success() => {
                     if let Ok(s) = std::fs::read_to_string(&fp8_ptx) {
@@ -88,23 +86,24 @@ fn main() {
                         println!("cargo:warning=FP8 CUDA kernels built");
                     }
                 }
-                Ok(s) => println!("cargo:warning=FP8 nvcc failed (status {s})"),
+                Ok(s) => println!(
+                    "cargo:warning=FP8 nvcc failed (status {s}) — FP8 kernels disabled"
+                ),
                 Err(e) => println!("cargo:warning=nvcc missing for FP8 ({e})"),
             }
         }
 
         if built {
             println!("cargo:rustc-cfg=sentinel_cuda_kernels");
+        } else {
+            println!(
+                "cargo:warning=Custom PTX not built; training/inference still use Candle CUDA ops"
+            );
         }
     }
 
     let rs = out_dir.join("sentinel_ptx.rs");
     if built && !ptx_blobs.is_empty() {
-        // Concatenate PTX modules (each is a separate module string — candle loads one string;
-        // use primary + note FP8 functions need same load. cudarc loads whole PTX string:
-        // multiple .version sections may fail. Prefer single combined by only using first
-        // successful full compile: merge into one file via nvcc device-link is hard.
-        // Strategy: ship TWO constants.
         let main = ptx_blobs.first().cloned().unwrap_or_default();
         let fp8 = if ptx_blobs.len() > 1 {
             ptx_blobs[1].clone()
