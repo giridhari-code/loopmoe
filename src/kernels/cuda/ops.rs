@@ -62,7 +62,6 @@ impl CustomOp2 for SiluMulOp {
         s2: &CpuStorage,
         l2: &Layout,
     ) -> CResult<(CpuStorage, Shape)> {
-        // Prefer f32 CPU path; other dtypes fall back via caller.
         let g = match s1 {
             CpuStorage::F32(v) => v,
             _ => candle_core::bail!("silu_mul cpu: use Candle fallback for non-f32"),
@@ -106,12 +105,19 @@ impl CustomOp2 for SiluMulOp {
         })?;
         let dev = s1.device();
         let n = l1.shape().elem_count();
-        if n == 0 || n > u32::MAX as usize {
+        if n == 0 {
+            // Empty tensor — allocate zero-length output matching shape
+            let dst = unsafe { dev.alloc::<f32>(0) }.w()?;
+            // dtype-agnostic empty: fall through to bail so caller uses Candle
+            let _ = dst;
+            candle_core::bail!("silu_mul: empty tensor");
+        }
+        if n > u32::MAX as usize {
             candle_core::bail!("silu_mul: element count exceeds CUDA kernel limit");
         }
         let block = 256u32;
         let n_u32 = n as u32;
-        let grid = n_u32 / block + u32::from(n_u32 % block != 0);
+        let grid = n_u32.div_ceil(block);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (block, 1, 1),
@@ -172,13 +178,30 @@ impl CustomOp2 for SiluMulOp {
 }
 
 pub fn silu_mul(gate: &Tensor, up: &Tensor) -> CResult<Tensor> {
-    if kernels_available(gate) && gate.dtype() == up.dtype() && gate.shape() == up.shape() {
-        if let Ok(t) = gate.apply_op2_no_bwd(up, &SiluMulOp) {
+    if gate.shape() != up.shape() {
+        candle_core::bail!(
+            "silu_mul: shape mismatch {:?} vs {:?}",
+            gate.shape(),
+            up.shape()
+        );
+    }
+    if gate.dtype() != up.dtype() {
+        candle_core::bail!(
+            "silu_mul: dtype mismatch {:?} vs {:?}",
+            gate.dtype(),
+            up.dtype()
+        );
+    }
+    // Force contiguous so custom CUDA op sees linear memory
+    let gate_c = gate.contiguous()?;
+    let up_c = up.contiguous()?;
+    if kernels_available(&gate_c) {
+        if let Ok(t) = gate_c.apply_op2_no_bwd(&up_c, &SiluMulOp) {
             return Ok(t);
         }
     }
-    let s = candle_nn::ops::silu(gate)?;
-    Ok((s * up)?)
+    let s = candle_nn::ops::silu(&gate_c)?;
+    Ok((s * up_c)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -235,7 +258,7 @@ impl CustomOp1 for ScaleOp {
         }
         let block = 256u32;
         let n_u32 = n as u32;
-        let grid = n_u32 / block + u32::from(n_u32 % block != 0);
+        let grid = n_u32.div_ceil(block);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (block, 1, 1),
@@ -293,32 +316,41 @@ impl CustomOp1 for ScaleOp {
 }
 
 pub fn scale_mul(x: &Tensor, scale: f32) -> CResult<Tensor> {
-    if kernels_available(x) {
-        if let Ok(t) = x.apply_op1_no_bwd(&ScaleOp { scale }) {
+    let x_c = x.contiguous()?;
+    if kernels_available(&x_c) {
+        if let Ok(t) = x_c.apply_op1_no_bwd(&ScaleOp { scale }) {
             return Ok(t);
         }
     }
-    Ok((x * f64::from(scale))?)
+    Ok((x_c * f64::from(scale))?)
 }
 
 // ---------------------------------------------------------------------------
-// scatter_add_rows — CustomOp2(base, values) + indices carried in struct
+// scatter_add_rows
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct ScatterAddOp {
-    /// Device tensor of int32 indices, length = values.dim(0).
-    /// Stored as raw pointer is unsafe across devices; we re-resolve from Tensor id
-    /// by requiring caller to pass contiguous int32 via a side channel.
-    /// Instead: indices are the first input through a different design —
-    /// we pack nothing here and use a three-tensor path via storage launch helper.
-    n: u32,
-    h: u32,
-}
 
 /// Scatter-add using custom CUDA kernel when possible.
 /// `indices`: 1-D int/uint token ids (length n), `values`: (n, h), `base`: (t, h).
 pub fn scatter_add_rows(base: &Tensor, indices: &Tensor, values: &Tensor) -> CResult<Tensor> {
+    let n = indices.dims1()?;
+    let (t, h) = base.dims2()?;
+    let v_dims = values.dims();
+    if v_dims != [n, h] {
+        candle_core::bail!(
+            "scatter_add_rows: values shape {:?} must be (n={}, h={})",
+            v_dims,
+            n,
+            h
+        );
+    }
+    // Empty scatter is a no-op — never launch a 0-grid CUDA kernel
+    if n == 0 {
+        return Ok(base.clone());
+    }
+    if t == 0 || h == 0 {
+        candle_core::bail!("scatter_add_rows: base has zero dimension");
+    }
+
     #[cfg(feature = "cuda")]
     {
         if let Ok(t) = scatter_add_rows_cuda(base, indices, values) {
@@ -326,8 +358,6 @@ pub fn scatter_add_rows(base: &Tensor, indices: &Tensor, values: &Tensor) -> CRe
         }
     }
     // Candle fallback (works all dtypes / devices)
-    let h = values.dim(1)?;
-    let n = indices.dims1()?;
     let idx = indices
         .to_dtype(DType::U32)?
         .unsqueeze(1)?
@@ -346,7 +376,7 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
         candle_core::bail!("no cuda kernels");
     }
     let dtype = base.dtype();
-    let kname = scatter_kernel_name(dtype).ok_or_else(|| {
+    let _kname = scatter_kernel_name(dtype).ok_or_else(|| {
         candle_core::Error::Msg("scatter dtype".into())
     })?;
     if values.dtype() != dtype {
@@ -355,28 +385,14 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
 
     let (t, h) = base.dims2()?;
     let n = indices.dims1()?;
-    if values.dims() != [n, h] {
-        candle_core::bail!("values shape must be (n, h)");
+    // n == 0 already handled by caller
+    if n > u32::MAX as usize || h > u32::MAX as usize || t > u32::MAX as usize {
+        candle_core::bail!("scatter dimensions exceed u32");
     }
 
-    // Clone base into mutable output (scatter-add accumulates into a copy)
     let out = base.contiguous()?;
     let idx_i32 = indices.to_dtype(DType::I32)?.contiguous()?;
     let vals = values.contiguous()?;
-
-    // Launch via a dummy CustomOp1 on `out` is awkward; use apply_op1 with closure data.
-    // Direct path: force cuda storage access through a tiny CustomOp1 that only needs out.
-    // We embed n,h and use thread-local... no.
-    //
-    // Practical approach: use Candle scatter for correctness if we cannot get three slices.
-    // Try launching through SiluMul-style by packing — for now call through
-    // `out.apply_op2_no_bwd(vals, &ScatterPair { ...})` won't get indices.
-    //
-    // Use Tensor::from + internal: fall back to candle scatter_add which IS a CUDA kernel
-    // in Candle, then additionally document our kernel for future CustomOp3.
-    //
-    // Attempt CustomOp2(out, vals) where indices live in Arc inside op — indices must be
-    // CudaStorage. We'll clone indices into the op as Tensor (reference counted).
 
     struct ScatterPair {
         idx: Tensor,
@@ -407,6 +423,9 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
             if !ptx_ready() {
                 candle_core::bail!("no ptx");
             }
+            if self.n == 0 {
+                candle_core::bail!("scatter n=0");
+            }
             let dtype = s_out.dtype();
             let kname = scatter_kernel_name(dtype).ok_or_else(|| {
                 candle_core::Error::Msg("dtype".into())
@@ -414,7 +433,6 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
             let dev = s_out.device();
             let func = dev.get_or_load_custom_func(kname, "sentinel_kernels", SENTINEL_PTX)?;
 
-            // indices tensor storage
             let idx_storage = match self.idx.storage_and_layout() {
                 (candle_core::Storage::Cuda(s), layout) => (s, layout),
                 _ => candle_core::bail!("indices must be cuda"),
@@ -424,11 +442,10 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                 .as_cuda_slice::<i32>()?
                 .slice(idx_storage.1.start_offset()..);
 
-            // Work in-place conceptually: alloc dst = copy of out, atomic add values
             let n_elem = l_out.shape().elem_count();
             let cfg = LaunchConfig {
                 grid_dim: (self.n, 1, 1),
-                block_dim: (256, 1, 1),
+                block_dim: (256.min(self.h.max(1)), 1, 1),
                 shared_mem_bytes: 0,
             };
 
@@ -436,7 +453,6 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                 DType::F32 => {
                     let src = s_out.as_cuda_slice::<f32>()?.slice(l_out.start_offset()..);
                     let dst = unsafe { dev.alloc::<f32>(n_elem) }.w()?;
-                    // copy base → dst
                     dev.dtod_copy(&src.slice(0..n_elem), &dst).w()?;
                     let val = s_val.as_cuda_slice::<f32>()?.slice(l_val.start_offset()..);
                     let mut b = func.builder();
