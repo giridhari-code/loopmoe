@@ -1,7 +1,7 @@
 //! loopmoe / Sentinel v1.0 — high-performance inference runtime
 //!
 //! Professional modular layout:
-//! - `server`      OpenAI-compatible HTTP + SSE
+//! - `server`      OpenAI-compatible HTTP + SSE (requires `server` feature)
 //! - `scheduler`   continuous batching + paged KV
 //! - `engine`      InferenceEngine + future continuous-batch executor
 //! - `model`       Looped-MoE + future Llama/Qwen
@@ -11,7 +11,9 @@
 pub mod config;
 pub mod error;
 
+#[cfg(feature = "server")]
 pub mod server;
+
 pub mod scheduler;
 pub mod engine;
 pub mod model;
