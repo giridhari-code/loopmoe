@@ -91,24 +91,17 @@ impl ContinuousScheduler {
         let mut num_batched_tokens = 0usize;
         let mut prompt_run = false;
 
-        // 1. Reap finished from running
-        self.running.retain(|s| {
-            if s.is_finished() {
-                finished_ids.push(s.id);
-                false
-            } else {
-                true
-            }
-        });
-        // Free blocks of finished
-        for id in &finished_ids {
-            if let Some(pos) = self.running.iter().position(|s| s.id == *id) {
-                let seq = self.running.remove(pos);
+        // 1. Reap finished from running + free their blocks
+        let mut still_running = Vec::with_capacity(self.running.len());
+        for seq in self.running.drain(..) {
+            if seq.is_finished() {
+                finished_ids.push(seq.id);
                 self.block_manager.free_many(&seq.block_table);
+            } else {
+                still_running.push(seq);
             }
         }
-        // Also free any we already removed via retain — track separately
-        // (retain already dropped them; free blocks when finishing via finish_sequence)
+        self.running = still_running;
 
         // 2. Prefer continuing running (decode) sequences
         for seq in self.running.iter_mut() {
@@ -119,7 +112,6 @@ impl ContinuousScheduler {
             if num_batched_tokens + tokens > self.cfg.max_num_batched_tokens {
                 break;
             }
-            // Ensure capacity for one more token
             let need = self
                 .block_manager
                 .blocks_for_tokens(seq.len() + 1)
@@ -148,7 +140,7 @@ impl ContinuousScheduler {
                 waiting_keep.push(seq);
                 continue;
             }
-            let prompt_tokens = seq.prompt_len;
+            let prompt_tokens = seq.prompt_len.max(1);
             if num_batched_tokens + prompt_tokens > self.cfg.max_num_batched_tokens
                 && !scheduled_ids.is_empty()
             {
