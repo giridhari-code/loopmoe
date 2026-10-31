@@ -178,7 +178,6 @@ impl BatchEngine {
         let outputs = self.scheduler.schedule();
         self.metrics.preempted += outputs.preempted.len() as u64;
 
-        // Ledger sync
         if let Some(led) = self.ledger.as_mut() {
             for &id in outputs.finished.iter().chain(outputs.preempted.iter()) {
                 led.free_seq(id);
@@ -197,7 +196,6 @@ impl BatchEngine {
 
         let use_tesla = self.tesla.as_ref().map(|t| t.enabled).unwrap_or(false);
 
-        // Build PackedBatch for non-Tesla paths
         let mut prefill_items = Vec::new();
         let mut decode_items = Vec::new();
         for &id in &outputs.prefill_ids {
@@ -229,7 +227,7 @@ impl BatchEngine {
                 continue;
             }
             if use_tesla {
-                continue; // Tesla handled separately
+                continue;
             }
             if let Some(seq) = self.scheduler.get(id) {
                 let last = *seq.tokens.last().unwrap_or(&0);
@@ -273,11 +271,11 @@ impl BatchEngine {
             slots,
         };
 
-        // Pulse for plain prefill + decode
         if !pack.is_empty() {
             let mut caches_map = HashMap::new();
             let mut gen_map = HashMap::new();
             let mut rng_map = HashMap::new();
+            let mut mtp_map = HashMap::new();
             let mut samp_map = HashMap::new();
 
             for item in &pack.items {
@@ -285,6 +283,7 @@ impl BatchEngine {
                     gen_map.insert(item.seq_id, rt.generated);
                     rng_map.insert(item.seq_id, rt.rng);
                     caches_map.insert(item.seq_id, rt.caches);
+                    mtp_map.insert(item.seq_id, rt.mtp);
                 }
                 if let Some(seq) = self.scheduler.get(item.seq_id) {
                     samp_map.insert(item.seq_id, seq.sampling.clone());
@@ -296,14 +295,14 @@ impl BatchEngine {
             self.metrics.pulse_decode_forwards += pout.metrics.decode_forwards;
             self.metrics.pulse_prefill_forwards += pout.metrics.prefill_forwards;
 
-            for (id, new_toks) in pout.new_tokens {
-                for &t in &new_toks {
+            for (id, new_toks) in &pout.new_tokens {
+                for &t in new_toks {
                     self.metrics.tokens_generated += 1;
-                    if let Some(seq) = self.scheduler.get_mut(id) {
+                    if let Some(seq) = self.scheduler.get_mut(*id) {
                         let is_prefill = pack
                             .items
                             .iter()
-                            .any(|i| i.seq_id == id && i.role == PackRole::Prefill);
+                            .any(|i| i.seq_id == *id && i.role == PackRole::Prefill);
                         if is_prefill {
                             seq.append_token(t);
                             seq.mark_computed(seq.prompt_len);
@@ -325,41 +324,25 @@ impl BatchEngine {
                         }
                     }
                     if let Some(led) = self.ledger.as_mut() {
-                        let _ = led.append_token_slot(id);
+                        let _ = led.append_token_slot(*id);
                     }
                 }
-                // restore runtime
-                if let (Some(caches), Some(generated), Some(rng)) = (
-                    caches_map.remove(&id),
-                    gen_map.remove(&id),
-                    rng_map.remove(&id),
-                ) {
-                    self.runtimes.insert(
-                        id,
-                        SeqRuntime {
-                            caches,
-                            mtp: self
-                                .runtimes
-                                .remove(&id)
-                                .map(|r| r.mtp)
-                                .unwrap_or_default(),
-                            generated,
-                            rng,
-                        },
-                    );
-                }
             }
-            // restore any left
-            for (id, caches) in caches_map {
+
+            // Restore all extracted runtimes (preserve MTP)
+            let ids: Vec<u64> = caches_map.keys().copied().collect();
+            for id in ids {
+                let caches = caches_map.remove(&id).unwrap();
                 let generated = gen_map.remove(&id).unwrap_or_default();
                 let rng = rng_map
                     .remove(&id)
                     .unwrap_or_else(|| StdRng::seed_from_u64(id));
+                let mtp = mtp_map.remove(&id).unwrap_or_default();
                 self.runtimes.insert(
                     id,
                     SeqRuntime {
                         caches,
-                        mtp: MtpState::default(),
+                        mtp,
                         generated,
                         rng,
                     },
@@ -367,7 +350,6 @@ impl BatchEngine {
             }
         }
 
-        // Tesla decode path (still per-seq)
         if use_tesla {
             for &id in &outputs.decode_ids {
                 if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
@@ -382,7 +364,6 @@ impl BatchEngine {
             }
         }
 
-        // Finish reap
         let newly_done: Vec<u64> = self
             .scheduler
             .running_ids()
