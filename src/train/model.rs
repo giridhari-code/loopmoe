@@ -3,6 +3,7 @@ use anyhow::Result;
 use candle_core::{DType, Device, IndexOp, Module, Result as CResult, Tensor, D};
 use candle_nn::{embedding, linear_no_bias, rms_norm, Embedding, Linear, RmsNorm, VarBuilder, VarMap};
 use crate::config::ModelConfig;
+use crate::model::rope::RotaryEmbedding;
 
 struct Expert { w1: Linear, w2: Linear, w3: Linear }
 impl Expert {
@@ -40,7 +41,7 @@ impl Moe {
         let (b, s, h) = x.dims3()?;
         let flat = x.reshape((b * s, h))?;
         let logits = self.gate.forward(&flat)?;
-        let (topk_w, topk_ids) = logits.topk(self.top_k)?;
+        let (topk_w, topk_ids) = crate::kernels::fertile::topk_last(&logits, self.top_k)?;
         let topk_w = candle_nn::ops::softmax_last_dim(&topk_w)?;
         let mut out = Tensor::zeros((b * s, h), x.dtype(), x.device())?;
         for e in &self.shared { out = (out + e.forward(&flat)?)?; }
@@ -76,7 +77,7 @@ impl Moe {
     }
 }
 
-struct Attn { q: Linear, k: Linear, v: Linear, o: Linear, n_heads: usize, n_kv: usize, head_dim: usize }
+struct Attn { q: Linear, k: Linear, v: Linear, o: Linear, n_heads: usize, n_kv: usize, head_dim: usize, rope: RotaryEmbedding }
 impl Attn {
     fn load(vb: VarBuilder, cfg: &ModelConfig) -> CResult<Self> {
         let hd = cfg.head_dim;
@@ -86,12 +87,15 @@ impl Attn {
             v: linear_no_bias(cfg.hidden_size, cfg.num_key_value_heads * hd, vb.pp("v_proj"))?,
             o: linear_no_bias(cfg.num_attention_heads * hd, cfg.hidden_size, vb.pp("o_proj"))?,
             n_heads: cfg.num_attention_heads, n_kv: cfg.num_key_value_heads, head_dim: hd,
+            rope: RotaryEmbedding::new(hd, cfg.max_seq_len.min(cfg.max_position_embeddings), cfg.rope_theta, vb.device(), vb.dtype())?,
         })
     }
     fn forward(&self, x: &Tensor) -> CResult<Tensor> {
         let (b, s, _) = x.dims3()?;
         let q = self.q.forward(x)?.reshape((b, s, self.n_heads, self.head_dim))?.transpose(1, 2)?;
+        let q = self.rope.forward(&q, 0)?;
         let mut k = self.k.forward(x)?.reshape((b, s, self.n_kv, self.head_dim))?.transpose(1, 2)?;
+        k = self.rope.forward(&k, 0)?;
         let mut v = self.v.forward(x)?.reshape((b, s, self.n_kv, self.head_dim))?.transpose(1, 2)?;
         if self.n_kv != self.n_heads {
             let rep = self.n_heads / self.n_kv;
@@ -121,7 +125,8 @@ impl Block {
     }
     fn forward(&mut self, x: &Tensor) -> CResult<Tensor> {
         let h = (x + self.attn.forward(&self.ln1.forward(x)?)?)?;
-        h + self.moe.forward(&self.ln2.forward(&h)?)?
+        let m = self.moe.forward(&self.ln2.forward(&h)?)?;
+        h + m
     }
 }
 
@@ -163,7 +168,7 @@ impl SentinelTrainModel {
             let logits_s = logits.i((.., 0..logits.dim(1)? - 1, ..))?;
             let labels_s = labels.i((.., 1..labels.dim(1)?))?;
             let (b, t, v) = logits_s.dims3()?;
-            let ce = candle_nn::loss::cross_entropy(&logits_s.reshape((b * t, v))?, &labels_s.reshape((b * t,))?.to_dtype(DType::U32)?)?;
+            let ce = masked_ce(&logits_s.reshape((b * t, v))?, &labels_s.reshape((b * t,))?)?;
             let _ = aux;
             Some(ce)
         } else { None };
@@ -173,4 +178,19 @@ impl SentinelTrainModel {
     pub fn parameters(&self) -> Result<Vec<candle_core::Var>> {
         Ok(self.varmap.all_vars())
     }
+}
+
+/// Cross-entropy that ignores label -100.
+fn masked_ce(logits: &Tensor, labels: &Tensor) -> CResult<Tensor> {
+    let dev = logits.device();
+    let lab = labels.to_vec1::<i64>()?;
+    let safe: Vec<u32> = lab.iter().map(|&l| if l < 0 { 0 } else { l as u32 }).collect();
+    let mask: Vec<f32> = lab.iter().map(|&l| if l < 0 { 0.0 } else { 1.0 }).collect();
+    let n = lab.len();
+    let cnt = mask.iter().sum::<f32>().max(1.0) as f64;
+    let safe = Tensor::from_vec(safe, (n, 1), dev)?;
+    let mask = Tensor::from_vec(mask, (n,), dev)?;
+    let lp = candle_nn::ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
+    let picked = lp.gather(&safe, 1)?.squeeze(1)?;
+    picked.neg()?.mul(&mask)?.sum_all()? / cnt
 }

@@ -14,7 +14,7 @@ pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
     let mut model = SentinelTrainModel::new(&cfg.model, device, dtype_for_train())?;
     model.aux_coef = cfg.moe_aux_coef;
     if let Some(init) = &cfg.init_from {
-        load_varmap(&model.varmap, Path::new(init), device)?;
+        load_varmap(&mut model.varmap, Path::new(init), device)?;
     }
     let data = load_lm_jsonl(Path::new(&cfg.data_path), cfg.max_seq_len)?;
     let mut opt = AdamW::new(model.parameters()?, ParamsAdamW { lr: cfg.lr, weight_decay: cfg.weight_decay, ..Default::default() })?;

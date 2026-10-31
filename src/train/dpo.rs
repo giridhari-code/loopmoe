@@ -17,7 +17,7 @@ fn ids_as_lm(ids: Vec<u32>) -> LmExample {
 pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
     let Some(init) = &cfg.init_from else { bail!("dpo requires init_from"); };
     let mut policy = SentinelTrainModel::new(&cfg.model, device, dtype_for_train())?;
-    load_varmap(&policy.varmap, Path::new(init), device)?;
+    load_varmap(&mut policy.varmap, Path::new(init), device)?;
     let data = load_dpo_jsonl(Path::new(&cfg.data_path), cfg.max_seq_len)?;
     let mut opt = AdamW::new(policy.parameters()?, ParamsAdamW { lr: cfg.lr, weight_decay: 0.0, ..Default::default() })?;
     let beta = cfg.dpo_beta;
@@ -34,7 +34,7 @@ pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
             let (_, loss_c) = policy.forward(&c_ids, Some(&c_lab))?;
             let (_, loss_r) = policy.forward(&r_ids, Some(&r_lab))?;
             let delta = ((&loss_c.expect("c") - &loss_r.expect("r"))? * beta)?;
-            let loss = candle_nn::ops::softplus(&delta)?;
+            let loss = (delta.exp()? + 1.0)?.log()?; // softplus
             let loss_s = loss.to_scalar::<f32>()? as f64;
             opt.backward_step(&loss)?;
             step += 1;

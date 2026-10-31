@@ -3,7 +3,7 @@ use std::path::Path;
 use crate::{
     config::ModelConfig,
     model::LoopedMoE,
-    cache::{kv_bytes_estimate, LayerCaches},
+    cache::{kv_bytes_estimate, LayerCaches, MlaCaches, RuntimeCaches},
     kernels::BackendInfo,
     sampler::{sample_token, is_stop, SamplingParams},
     tesla::{draft_tokens, schedule_verify_len, verify_and_accept, TeslaConfig, TeslaStepStats},
@@ -50,7 +50,11 @@ impl InferenceEngine {
         if input_ids.is_empty() { anyhow::bail!("empty prompt"); }
         let prompt_len = input_ids.len();
         let capacity = (prompt_len + max_new_tokens).min(self.config.max_seq_len).max(prompt_len + 1);
-        let mut caches = LayerCaches::with_capacity(self.config.num_layers, 1, self.config.num_key_value_heads, self.config.head_dim, capacity, self.dtype, &self.device);
+        let mut caches = if self.config.use_mla {
+            RuntimeCaches::Mla(MlaCaches::new(self.config.num_layers))
+        } else {
+            RuntimeCaches::Gqa(LayerCaches::with_capacity(self.config.num_layers, 1, self.config.num_key_value_heads, self.config.head_dim, capacity, self.dtype, &self.device))
+        };
         let mut rng = match params.seed { Some(s) => StdRng::seed_from_u64(s), None => StdRng::from_entropy() };
         let mut tokens = input_ids.to_vec();
         let mut generated: Vec<u32> = Vec::new();

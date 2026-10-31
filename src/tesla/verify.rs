@@ -1,6 +1,6 @@
 use candle_core::{Device, Result as CResult, Tensor};
 use crate::model::LoopedMoE;
-use crate::cache::LayerCaches;
+use crate::cache::RuntimeCaches;
 use crate::sampler::{sample_token, SamplingParams};
 use rand::Rng;
 
@@ -23,7 +23,7 @@ fn squeeze(logits: &Tensor) -> CResult<Tensor> {
 
 pub fn verify_and_accept(
     model: &LoopedMoE,
-    caches: &mut LayerCaches,
+    caches: &mut RuntimeCaches,
     lens_before_draft: &[usize],
     prev_token: u32,
     pos_before_draft: usize,

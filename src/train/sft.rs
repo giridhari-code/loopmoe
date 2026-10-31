@@ -12,7 +12,7 @@ use super::model::SentinelTrainModel;
 pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
     let Some(init) = &cfg.init_from else { bail!("sft requires init_from"); };
     let mut model = SentinelTrainModel::new(&cfg.model, device, dtype_for_train())?;
-    load_varmap(&model.varmap, Path::new(init), device)?;
+    load_varmap(&mut model.varmap, Path::new(init), device)?;
     let data = load_lm_jsonl(Path::new(&cfg.data_path), cfg.max_seq_len)?;
     let mut opt = AdamW::new(model.parameters()?, ParamsAdamW { lr: cfg.lr, weight_decay: 0.0, ..Default::default() })?;
     let mut step = 0usize;

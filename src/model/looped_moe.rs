@@ -37,7 +37,7 @@ impl LoopedMoE {
     }
 
     pub fn forward(
-        &self, input_ids: &Tensor, start_pos: usize, caches: Option<&mut RuntimeCaches>,
+        &self, input_ids: &Tensor, start_pos: usize, mut caches: Option<&mut RuntimeCaches>,
     ) -> CandleResult<Tensor> {
         let (_b, seq_len) = input_ids.dims2()?;
         let mut hidden = self.embed_tokens.forward(input_ids)?;
@@ -45,7 +45,7 @@ impl LoopedMoE {
         for loop_idx in 0..num_loops {
             let update_cache = loop_idx == num_loops - 1;
             for (layer_idx, layer) in self.layers.iter().enumerate() {
-                match caches {
+                match caches.as_deref_mut() {
                     Some(RuntimeCaches::Gqa(bank)) => {
                         let cache = &mut bank.layers[layer_idx];
                         hidden = layer.forward(&hidden, start_pos, Some(cache), None, update_cache)?;
