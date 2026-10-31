@@ -1,11 +1,11 @@
-//! loopmoe / miniinfer — high-performance inference runtime
+//! loopmoe / Sentinel v1.0 — high-performance inference runtime
 //!
 //! Professional modular layout:
 //! - `server`      OpenAI-compatible HTTP + SSE
 //! - `scheduler`   continuous batching + paged KV
-//! - `engine`      forward pass, sampling, metrics
-//! - `model`       architectures (Llama, Qwen, Looped-MoE)
-//! - `kernels`     CUDA / CPU kernels
+//! - `engine`      InferenceEngine + future continuous-batch executor
+//! - `model`       Looped-MoE + future Llama/Qwen
+//! - `kernels`     Fertile / DoBu / CUDA + new paged-attention stubs
 //! - `utils`       tokenizer, logging
 
 pub mod config;
@@ -18,7 +18,7 @@ pub mod model;
 pub mod kernels;
 pub mod utils;
 
-// Existing specialized modules (kept for compatibility during migration)
+// Existing specialized modules
 pub mod cache;
 pub mod parallel;
 pub mod recipe;
@@ -28,4 +28,22 @@ pub mod sampler;
 pub mod tokenizer;
 
 pub use config::{ModelConfig, ServerConfig};
-pub use error::Error;
+pub use engine::InferenceEngine;
+pub use model::{LoopedMoE, SentinelV1};
+pub use cache::{
+    KvCache, LayerCaches, MlaCache, MlaCaches, RuntimeCaches, kv_bytes_estimate, mla_bytes_estimate,
+};
+pub use kernels::{BackendKind, KERNEL_NAME};
+pub use sampler::SamplingParams;
+pub use tokenizer::Tokenizer;
+pub use recipe::{
+    ChatCompletionRequest, ChatCompletionResponse, Conversation, Message, RecipePipeline, Role,
+    SentinelEncoding,
+};
+pub use tesla::TeslaConfig;
+pub use parallel::{
+    ParallelConfig, ParallelismKind, DeviceMesh, RankInfo, ExpertParallelPlan, ExpertShard,
+    AllToAllStub, DispatchMeta, CombineMeta,
+};
+
+pub type Result<T> = anyhow::Result<T>;
