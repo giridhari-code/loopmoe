@@ -17,6 +17,7 @@
   "scoring_func": "softmax",
   "norm_topk_prob": true,
   "topk_method": "greedy",
+  "capacity_factor": 1.25,
   "max_position_embeddings": 131072,
   "max_seq_len": 4096,
   "rope_theta": 500000.0,
