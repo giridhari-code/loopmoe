@@ -3,7 +3,7 @@
 //! At each depth all beam nodes advance in **one batched forward** (batch matmul),
 //! not sequential per-node KV replay.
 
-use candle_core::{Device, IndexOp, Result as CResult, Tensor, D};
+use candle_core::{Device, IndexOp, Result as CResult, Tensor};
 use crate::model::LoopedMoE;
 use crate::cache::RuntimeCaches;
 use crate::sampler::SamplingParams;
@@ -32,7 +32,7 @@ struct BeamNode {
 
 /// Parallel tree draft: batch all beam last-tokens → one forward → branch top-w.
 /// Draft scoring uses `caches: None` so the batch path is pure parallel GEMM/attention
-//! without sequential KV restore/replay. Verify still uses real KV.
+/// without sequential KV restore/replay. Verify still uses real KV.
 pub fn draft_tree(
     model: &LoopedMoE,
     _caches: &mut RuntimeCaches,
@@ -61,20 +61,18 @@ pub fn draft_tree(
             break;
         }
 
-        // ---- Parallel batch forward: (B, 1) tokens in one call ----
+        // Parallel batch forward: (B, 1) tokens in one call
         let batch_toks: Vec<u32> = beam.iter().map(|n| n.last_token).collect();
         let input = Tensor::new(batch_toks.as_slice(), device)?.reshape((b, 1))?;
-        // start_pos + d approximates position for RoPE when cache is unused
-        let logits = model.forward(&input, start_pos + d, None)?; // (B, V) expected
+        let logits = model.forward(&input, start_pos + d, None)?;
 
         let logits_2d = match logits.dims() {
-            [bb, v] if *bb == b => logits.clone(),
-            [1, bb, v] if *bb == b => logits.squeeze(0)?,
-            [bb, 1, v] if *bb == b => logits.squeeze(1)?,
+            [bb, _v] if *bb == b => logits.clone(),
+            [1, bb, _v] if *bb == b => logits.squeeze(0)?,
+            [bb, 1, _v] if *bb == b => logits.squeeze(1)?,
             _ => logits.flatten_all()?.reshape((b, ()))?,
         };
 
-        // Parallel host expand of branches from each beam row
         let width = width;
         let use_margin = cfg.use_margin;
         let min_conf = cfg.min_confidence;
@@ -92,9 +90,8 @@ pub fn draft_tree(
                     0.0
                 };
 
-                let k = width;
                 let row_b = row.unsqueeze(0)?;
-                let (_vals, ids) = topk_last_ids(&row_b, k)?;
+                let (_vals, ids) = topk_last_ids(&row_b, width)?;
                 let id_tensor = ids.squeeze(0)?;
                 let id_vec = id_tensor.to_vec1::<u32>().or_else(|_| {
                     id_tensor
@@ -138,7 +135,6 @@ pub fn draft_tree(
             break;
         }
 
-        // Parallel sort by survival, keep top beams
         next_beam.par_sort_by(|a, b| {
             b.survival
                 .partial_cmp(&a.survival)
