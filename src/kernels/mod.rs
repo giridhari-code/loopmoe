@@ -16,4 +16,7 @@ pub use dobu::{
     KERNEL_SUITE,
 };
 
-pub use cuda::{kernels_built, kernels_available, silu_mul, scale_mul, scatter_add_rows};
+pub use cuda::{
+    kernels_built, kernels_available, silu_mul, scale_mul, scatter_add_rows,
+    tiled_gemm_nn, tiled_gemm_nt,
+};

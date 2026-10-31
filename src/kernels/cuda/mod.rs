@@ -5,8 +5,10 @@
 //! to portable Candle implementations.
 
 mod ops;
+mod gemm;
 
 pub use ops::{bias_add, rmsnorm, scale_mul, scatter_add_rows, silu_mul, kernels_available};
+pub use gemm::{tiled_gemm_nn, tiled_gemm_nt, should_use_tiled};
 
 include!(concat!(env!("OUT_DIR"), "/sentinel_ptx.rs"));
 

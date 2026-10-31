@@ -1,8 +1,7 @@
-// Sentinel custom CUDA kernels — f32 / f16 / bf16.
+// Sentinel custom CUDA kernels — f32 / f16 / bf16 + tiled GEMM.
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
-// ---- helpers ----
 __device__ __forceinline__ float silu_f(float x) {
     return x / (1.f + expf(-x));
 }
@@ -65,8 +64,6 @@ extern "C" __global__ void sentinel_scale_bf16(
 }
 
 // ===================== scatter_add_rows =====================
-// out[idx[row], col] += values[row, col]
-// idx: int32[n], values: [n, h], out: [t, h]
 
 extern "C" __global__ void sentinel_scatter_add_rows_f32(
     float *out, const int *idx, const float *values,
@@ -81,14 +78,10 @@ extern "C" __global__ void sentinel_scatter_add_rows_f32(
     }
 }
 
-// f16: atomic via float bit-width CAS is heavy; accumulate with native atomicAdd on sm_70+
-// Using float intermediate atomics into out interpreted carefully — prefer convert path:
-// load-add-store with atomicCAS on uint32 representation of __half.
 __device__ __forceinline__ void atomicAddHalf(__half *addr, __half val) {
 #if __CUDA_ARCH__ >= 700
     atomicAdd(addr, val);
 #else
-    // fallback: CAS loop
     unsigned short *addr_as_us = (unsigned short *)addr;
     unsigned short old = *addr_as_us, assumed;
     do {
@@ -112,7 +105,6 @@ extern "C" __global__ void sentinel_scatter_add_rows_f16(
     }
 }
 
-// bf16 atomicAdd requires sm_80+
 __device__ __forceinline__ void atomicAddBf16(__nv_bfloat16 *addr, __nv_bfloat16 val) {
 #if __CUDA_ARCH__ >= 800
     atomicAdd(addr, val);
@@ -141,7 +133,120 @@ extern "C" __global__ void sentinel_scatter_add_rows_bf16(
     }
 }
 
-// ===================== rmsnorm f32 (reference) =====================
+// ===================== tiled GEMM (NN): C[M,N] = A[M,K] @ B[K,N] =====================
+// TILE=16 shared-memory blocking, float accumulate for all dtypes.
+
+#define SENTINEL_TILE 16
+
+extern "C" __global__ void sentinel_gemm_nn_f32(
+    float *C, const float *A, const float *B,
+    int M, int N, int K
+) {
+    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE];
+    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE];
+    int row = blockIdx.y * SENTINEL_TILE + threadIdx.y;
+    int col = blockIdx.x * SENTINEL_TILE + threadIdx.x;
+    float acc = 0.f;
+    int tiles = (K + SENTINEL_TILE - 1) / SENTINEL_TILE;
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * SENTINEL_TILE + threadIdx.x;
+        int b_row = t * SENTINEL_TILE + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && a_col < K) ? A[row * K + a_col] : 0.f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (b_row < K && col < N) ? B[b_row * N + col] : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < SENTINEL_TILE; ++i) {
+            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row * N + col] = acc;
+}
+
+extern "C" __global__ void sentinel_gemm_nn_f16(
+    __half *C, const __half *A, const __half *B,
+    int M, int N, int K
+) {
+    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE];
+    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE];
+    int row = blockIdx.y * SENTINEL_TILE + threadIdx.y;
+    int col = blockIdx.x * SENTINEL_TILE + threadIdx.x;
+    float acc = 0.f;
+    int tiles = (K + SENTINEL_TILE - 1) / SENTINEL_TILE;
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * SENTINEL_TILE + threadIdx.x;
+        int b_row = t * SENTINEL_TILE + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && a_col < K) ? __half2float(A[row * K + a_col]) : 0.f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (b_row < K && col < N) ? __half2float(B[b_row * N + col]) : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < SENTINEL_TILE; ++i) {
+            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row * N + col] = __float2half(acc);
+}
+
+extern "C" __global__ void sentinel_gemm_nn_bf16(
+    __nv_bfloat16 *C, const __nv_bfloat16 *A, const __nv_bfloat16 *B,
+    int M, int N, int K
+) {
+    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE];
+    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE];
+    int row = blockIdx.y * SENTINEL_TILE + threadIdx.y;
+    int col = blockIdx.x * SENTINEL_TILE + threadIdx.x;
+    float acc = 0.f;
+    int tiles = (K + SENTINEL_TILE - 1) / SENTINEL_TILE;
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * SENTINEL_TILE + threadIdx.x;
+        int b_row = t * SENTINEL_TILE + threadIdx.y;
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && a_col < K) ? __bfloat162float(A[row * K + a_col]) : 0.f;
+        Bs[threadIdx.y][threadIdx.x] =
+            (b_row < K && col < N) ? __bfloat162float(B[b_row * N + col]) : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < SENTINEL_TILE; ++i) {
+            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row * N + col] = __float2bfloat16(acc);
+}
+
+// NT: C = A @ B^T  → B is (N,K) stored row-major as B[n,k], we need B^T[k,n] = B[n,k]
+extern "C" __global__ void sentinel_gemm_nt_f32(
+    float *C, const float *A, const float *B,
+    int M, int N, int K
+) {
+    __shared__ float As[SENTINEL_TILE][SENTINEL_TILE];
+    __shared__ float Bs[SENTINEL_TILE][SENTINEL_TILE];
+    int row = blockIdx.y * SENTINEL_TILE + threadIdx.y;
+    int col = blockIdx.x * SENTINEL_TILE + threadIdx.x;
+    float acc = 0.f;
+    int tiles = (K + SENTINEL_TILE - 1) / SENTINEL_TILE;
+    for (int t = 0; t < tiles; ++t) {
+        int a_col = t * SENTINEL_TILE + threadIdx.x;
+        int b_col = t * SENTINEL_TILE + threadIdx.y; // B is (N,K): B[col, k]
+        As[threadIdx.y][threadIdx.x] =
+            (row < M && a_col < K) ? A[row * K + a_col] : 0.f;
+        // load B^T tile: element (k, n) = B[n, k]
+        Bs[threadIdx.y][threadIdx.x] =
+            (col < N && b_col < K) ? B[col * K + b_col] : 0.f;
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < SENTINEL_TILE; ++i) {
+            acc += As[threadIdx.y][i] * Bs[i][threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (row < M && col < N) C[row * N + col] = acc;
+}
 
 extern "C" __global__ void sentinel_rmsnorm_f32(
     float *out, const float *x, const float *weight,

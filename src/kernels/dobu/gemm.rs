@@ -1,9 +1,7 @@
-//! DoBu GEMM — DeepGEMM-style interface (Candle backend).
-//!
-//! Future: swap body for DeepGEMM JIT kernels (FP8/FP4/BF16) while keeping the
-//! same public signatures.
+//! DoBu GEMM — tiled CUDA path + Candle/cuBLAS fallback.
 
 use candle_core::{IndexOp, Result as CResult, Tensor};
+use crate::kernels::cuda::{tiled_gemm_nn, tiled_gemm_nt};
 
 pub const KERNEL_GEMM: &str = "DoBu-GEMM";
 
@@ -34,6 +32,17 @@ impl Default for DobuGemmParams {
     }
 }
 
+fn matmul_layout(a: &Tensor, b: &Tensor, layout: DobuGemmLayout) -> CResult<Tensor> {
+    match layout {
+        DobuGemmLayout::Nn => tiled_gemm_nn(a, b),
+        DobuGemmLayout::Nt => tiled_gemm_nt(a, b),
+        DobuGemmLayout::Tn => {
+            // Aᵀ @ B — transpose A then NN tiled
+            tiled_gemm_nn(&a.t()?.contiguous()?, b)
+        }
+    }
+}
+
 /// Dense GEMM with optional bias (broadcast).
 pub fn dobu_gemm_nn(
     a: &Tensor,
@@ -41,11 +50,7 @@ pub fn dobu_gemm_nn(
     bias: Option<&Tensor>,
     layout: DobuGemmLayout,
 ) -> CResult<Tensor> {
-    let out = match layout {
-        DobuGemmLayout::Nn => a.matmul(b)?,
-        DobuGemmLayout::Nt => a.matmul(&b.t()?)?,
-        DobuGemmLayout::Tn => a.t()?.matmul(b)?,
-    };
+    let out = matmul_layout(a, b, layout)?;
     match bias {
         Some(c) => out.broadcast_add(c),
         None => Ok(out),
@@ -59,11 +64,7 @@ pub fn dobu_gemm(
     c: Option<&Tensor>,
     params: &DobuGemmParams,
 ) -> CResult<Tensor> {
-    let mut out = match params.layout {
-        DobuGemmLayout::Nn => a.matmul(b)?,
-        DobuGemmLayout::Nt => a.matmul(&b.t()?)?,
-        DobuGemmLayout::Tn => a.t()?.matmul(b)?,
-    };
+    let mut out = matmul_layout(a, b, params.layout)?;
     if (params.alpha - 1.0).abs() > 1e-6 {
         out = (out * params.alpha)?;
     }
@@ -76,9 +77,6 @@ pub fn dobu_gemm(
 }
 
 /// Grouped / expert GEMM used by MoE.
-/// `tokens`: (total_tokens, K)
-/// `weights`: (E, K, N)
-/// `offsets`: exclusive scan of length E+1 describing which token rows belong to each expert.
 pub fn dobu_grouped_gemm(
     tokens: &Tensor,
     weights: &Tensor,
@@ -102,14 +100,14 @@ pub fn dobu_grouped_gemm(
         }
         let chunk = tokens.narrow(0, start, end - start)?;
         let w = weights.i(ei)?;
-        outs.push((start, end, chunk.matmul(&w)?));
+        // Prefer tiled GEMM per expert chunk
+        outs.push((start, end, tiled_gemm_nn(&chunk, &w)?));
     }
 
     if outs.is_empty() {
         return Tensor::zeros((total, n), dtype, device);
     }
 
-    // Reconstruct dense (total, N) output, filling gaps with zeros.
     let mut parts = Vec::new();
     let mut cursor = 0usize;
     for (start, end, piece) in outs {

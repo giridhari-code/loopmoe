@@ -1,29 +1,22 @@
 # Sentinel custom CUDA kernels
 
-## Kernels (`sentinel.cu`)
+## Ops
 
 | Kernel | f32 | f16 | bf16 |
 |--------|-----|-----|------|
-| `sentinel_silu_mul_*` | yes | yes | yes |
-| `sentinel_scale_*` | yes | yes | yes |
-| `sentinel_scatter_add_rows_*` | yes | yes | yes |
-| `sentinel_rmsnorm_f32` | yes | — | — |
+| silu_mul | yes | yes | yes |
+| scale | yes | yes | yes |
+| scatter_add_rows | yes | yes | yes |
+| **tiled GEMM NN** (16×16) | yes | yes | yes |
+| tiled GEMM NT | yes | — | — |
 
-## Build
+## Tiled GEMM
+
+- Shared-memory **16×16** tiles, **float accumulate**
+- DoBu `dobu_gemm_*` + grouped expert GEMM call `tiled_gemm_nn` first
+- Auto-fallback to Candle/cuBLAS if PTX missing or size outside window
 
 ```bash
-export CUDA_COMPUTE_CAP=89   # optional
-cargo build --release --features cuda
+export CUDA_COMPUTE_CAP=89
+cargo build --release
 ```
-
-Needs `nvcc`. Without it → Candle fallbacks still work.
-
-## Wiring
-
-- **Expert FFN** → `silu_mul` (BF16 path used by default model dtype)
-- **Fertile** `device_scatter_add` → `scatter_add_rows` custom kernel
-
-## Notes
-
-- f16/bf16 atomics use hardware `atomicAdd` on sm_70+ / sm_80+, else CAS loop.
-- Full GEMM remains cuBLAS via Candle.
