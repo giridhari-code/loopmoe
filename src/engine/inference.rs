@@ -1,4 +1,5 @@
 use candle_core::{Device, Tensor, DType, IndexOp};
+use std::collections::HashMap;
 use std::path::Path;
 use crate::{
     config::ModelConfig,
@@ -13,6 +14,8 @@ use crate::{
         verify_and_accept, TeslaConfig, TeslaStepStats,
     },
     parallel::{DeviceMesh, ExpertParallelPlan, ParallelConfig},
+    scheduler::SchedulerConfig,
+    engine::batch::BatchEngine,
     Result,
 };
 use rand::{rngs::StdRng, SeedableRng};
@@ -103,7 +106,7 @@ impl InferenceEngine {
                 config.kv_lora_rank,
                 config.qk_rope_head_dim,
                 config.max_seq_len,
-                2, // BF16
+                2,
             );
             tracing::info!(
                 max_seq = config.max_seq_len,
@@ -157,6 +160,46 @@ impl InferenceEngine {
             return self.generate(input_ids, max_new_tokens, params);
         }
         self.generate_inner(input_ids, max_new_tokens, params, Some(tesla))
+    }
+
+    /// Multi-request continuous batching path.
+    ///
+    /// Each entry is `(prompt_ids, max_new_tokens)`. Shared sampling + optional Tesla.
+    /// Returns map of request index → full token sequence (prompt + generated).
+    pub fn generate_batch(
+        self,
+        requests: &[(Vec<u32>, usize)],
+        params: &SamplingParams,
+        tesla: Option<TeslaConfig>,
+        sched_cfg: SchedulerConfig,
+        num_gpu_blocks: usize,
+        block_size: usize,
+    ) -> Result<HashMap<usize, Vec<u32>>> {
+        let mut batch = BatchEngine::new(self, sched_cfg, num_gpu_blocks, block_size, tesla);
+        let mut id_to_idx: HashMap<u64, usize> = HashMap::new();
+
+        for (i, (prompt, max_tok)) in requests.iter().enumerate() {
+            let mut p = params.clone();
+            if let Some(seed) = params.seed {
+                p.seed = Some(seed.wrapping_add(i as u64));
+            }
+            let id = batch.add_request(
+                prompt.clone(),
+                p,
+                *max_tok,
+                Some(format!("req-{i}")),
+            );
+            id_to_idx.insert(id, i);
+        }
+
+        let raw = batch.run_all()?;
+        let mut out = HashMap::new();
+        for (id, tokens) in raw {
+            if let Some(&idx) = id_to_idx.get(&id) {
+                out.insert(idx, tokens);
+            }
+        }
+        Ok(out)
     }
 
     fn generate_inner(
