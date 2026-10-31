@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Sentinel v1.0 — Looped MoE inference + recipe API + Rust training"
 license = "Apache-2.0"
+build = "build.rs"
 
 [dependencies]
 candle-core = { version = "0.8", default-features = false }

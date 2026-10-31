@@ -1,7 +1,21 @@
-//! CUDA helpers for Fertile.
+//! Custom CUDA kernels for Sentinel (Fertile / DoBu).
+//!
+//! Built from `sentinel.cu` via `nvcc -ptx` in `build.rs` when the `cuda`
+//! feature is on and the toolkit is available. Otherwise all ops fall back
+//! to portable Candle implementations.
 
-use candle_core::Device;
+mod ops;
+
+pub use ops::{bias_add, rmsnorm, scale_mul, scatter_add_rows, silu_mul, kernels_available};
+
+include!(concat!(env!("OUT_DIR"), "/sentinel_ptx.rs"));
 
 pub fn cuda_available() -> bool {
-    Device::cuda_if_available(0).map(|d| d.is_cuda()).unwrap_or(false)
+    candle_core::Device::cuda_if_available(0)
+        .map(|d| d.is_cuda())
+        .unwrap_or(false)
+}
+
+pub fn kernels_built() -> bool {
+    SENTINEL_KERNELS_BUILT && !SENTINEL_PTX.is_empty()
 }

@@ -2,6 +2,7 @@ use candle_core::{Result as CandleResult, Tensor};
 use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
 use crate::config::ModelConfig;
 use crate::kernels::fertile::{fertile_moe, FertileExpert, FertileMoeParams, KERNEL_NAME};
+use crate::kernels::cuda::silu_mul;
 
 pub struct Expert {
     w1: Linear,
@@ -22,9 +23,11 @@ impl Expert {
 impl FertileExpert for Expert {
     #[inline]
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
-        let gate = candle_nn::ops::silu(&self.w1.forward(x)?)?;
+        let gate = self.w1.forward(x)?;
         let up = self.w3.forward(x)?;
-        self.w2.forward(&(gate * up)?)
+        // Fused silu(gate)*up — custom CUDA kernel when PTX built + f32
+        let hidden = silu_mul(&gate, &up)?;
+        self.w2.forward(&hidden)
     }
 }
 
@@ -53,7 +56,6 @@ impl MoeLayer {
             )?);
         }
 
-        // DeepInfer HF: shared_experts.{i}; Sentinel may pack as experts.{n_routed+i}
         let mut shared_experts = Vec::with_capacity(config.n_shared_experts);
         for i in 0..config.n_shared_experts {
             let idx = config.n_routed_experts + i;
@@ -84,6 +86,7 @@ impl MoeLayer {
             kernel = KERNEL_NAME,
             routed = config.n_routed_experts,
             shared = config.n_shared_experts,
+            cuda_kernels = crate::kernels::cuda::kernels_built(),
             "MoE layer loaded"
         );
 
