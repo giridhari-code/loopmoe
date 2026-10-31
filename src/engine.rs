@@ -172,7 +172,6 @@ impl InferenceEngine {
         let mut generated: Vec<u32> = Vec::new();
         let mut total_stats = TeslaStepStats::default();
 
-        // Prefill
         let prefill = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
         let logits = squeeze_logits(&self.model.forward(&prefill, 0, Some(&mut caches))?)?;
         let mut next = sample_token(&logits, params, &generated, &mut rng)?;
@@ -239,6 +238,7 @@ impl InferenceEngine {
                 total_stats.drafted += stats.drafted;
                 total_stats.scheduled += stats.scheduled;
                 total_stats.accepted += stats.accepted;
+                total_stats.forwards += stats.forwards;
 
                 for &t in &accepted {
                     tokens.push(t);
@@ -250,8 +250,9 @@ impl InferenceEngine {
                             drafted = total_stats.drafted,
                             scheduled = total_stats.scheduled,
                             accepted = total_stats.accepted,
+                            forwards = total_stats.forwards,
                             accept_rate = total_stats.acceptance_rate(),
-                            "Tesla stats"
+                            "Tesla stats (chunk verify)"
                         );
                         return Ok(tokens);
                     }
@@ -275,8 +276,9 @@ impl InferenceEngine {
                 drafted = total_stats.drafted,
                 scheduled = total_stats.scheduled,
                 accepted = total_stats.accepted,
+                forwards = total_stats.forwards,
                 accept_rate = total_stats.acceptance_rate(),
-                "Tesla stats"
+                "Tesla stats (chunk verify)"
             );
         }
         caches.clear();

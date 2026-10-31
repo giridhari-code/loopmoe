@@ -1,8 +1,14 @@
 //! **Tesla** — Sentinel speculative decoding (DSpark-inspired).
 //! DeepSeek name: DSpark. Sentinel name: Tesla.
 //!
-//! Confidence-scheduled draft → verify with KV rewind.
-//! Optimizations: GPU-friendly confidence, top-2 margin, survival product.
+//! Confidence-scheduled draft → **chunk verify** (one sequence forward =
+//! heavy matrix multiplications once) → KV rewind on reject.
+//!
+//! Optimizations:
+//! - GPU-friendly confidence + top-2 margin
+//! - Survival-product + margin-aware schedule
+//! - Chunk verify (O(1) forwards per step vs O(k))
+//! - Greedy argmax fast-path
 
 pub mod config;
 pub mod confidence;
