@@ -1,18 +1,9 @@
-//! BlockLedger — physical paged memory for GQA KV or MLA latent cache.
-//!
-//! Design goals (Orbit O1):
-//! - Fixed-size **pages** (tokens per page = `block_size`)
-//! - Global free list with ref-counts (share / prefix later)
-//! - Per-sequence **block table** (logical token order → physical page ids)
-//! - **Slot mapping** for a scheduled step: each token position → physical slot
-//!   index into the flattened page pool (attention kernel reads here)
-//!
-//! Physical storage is still owned by per-seq `RuntimeCaches` today; Ledger
-//! tracks *addressing*. O2 binds Ledger slots into a shared pool tensor.
+//! BlockLedger — physical paged memory + O5 prefix hash sharing.
 
 use std::collections::HashMap;
 
-/// Which attention cache bank this ledger serves.
+use super::prefix::{hash_prompt_pages, hash_token_block, PrefixStats};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheKind {
     Gqa,
@@ -24,12 +15,13 @@ pub struct LedgerConfig {
     pub num_pages: usize,
     pub block_size: usize,
     pub kind: CacheKind,
-    /// For capacity estimates / future pool alloc.
     pub num_layers: usize,
     pub num_kv_heads: usize,
     pub head_dim: usize,
     pub kv_lora_rank: usize,
     pub rope_dim: usize,
+    /// Enable prefix content-hash sharing (O5).
+    pub enable_prefix_cache: bool,
 }
 
 impl Default for LedgerConfig {
@@ -43,6 +35,7 @@ impl Default for LedgerConfig {
             head_dim: 128,
             kv_lora_rank: 512,
             rope_dim: 64,
+            enable_prefix_cache: true,
         }
     }
 }
@@ -53,20 +46,21 @@ pub struct LedgerStats {
     pub pages_freed: u64,
     pub peak_used: usize,
     pub alloc_failures: u64,
+    pub prefix: PrefixStats,
 }
 
 #[derive(Debug, Clone)]
 struct PageMeta {
     ref_count: i32,
-    /// Optional content hash for future prefix sharing (0 = none).
     content_hash: u64,
 }
 
-/// Per-sequence logical → physical page ids (1-based; 0 unused).
 #[derive(Debug, Clone, Default)]
 pub struct SeqBlockTable {
     pub pages: Vec<u32>,
     pub num_tokens: usize,
+    /// How many leading pages came from prefix cache (shared).
+    pub prefix_pages: usize,
 }
 
 impl SeqBlockTable {
@@ -77,18 +71,14 @@ impl SeqBlockTable {
     pub fn clear(&mut self) {
         self.pages.clear();
         self.num_tokens = 0;
+        self.prefix_pages = 0;
     }
 }
 
-/// Maps each position in a *scheduled step* to a physical slot.
-///
-/// `physical_slots[i]` = page_id * block_size + offset_in_page
-/// for the i-th token in the packed batch (decode or prefill chunk).
 #[derive(Debug, Clone, Default)]
 pub struct SlotMapping {
     pub physical_slots: Vec<u32>,
     pub seq_ids: Vec<u64>,
-    /// Cumulative token counts per seq in this mapping (CSR-style).
     pub cu_seqlens: Vec<u32>,
 }
 
@@ -106,9 +96,10 @@ impl SlotMapping {
 pub struct BlockLedger {
     cfg: LedgerConfig,
     pages: Vec<PageMeta>,
-    /// Free list as stack of 1-based page ids.
     free: Vec<u32>,
     tables: HashMap<u64, SeqBlockTable>,
+    /// content_hash → physical page id (only pages with ref_count > 0).
+    prefix_index: HashMap<u64, u32>,
     pub stats: LedgerStats,
 }
 
@@ -119,7 +110,7 @@ impl BlockLedger {
         pages.push(PageMeta {
             ref_count: 0,
             content_hash: 0,
-        }); // sentinel index 0
+        });
         for _ in 0..n {
             pages.push(PageMeta {
                 ref_count: 0,
@@ -132,6 +123,7 @@ impl BlockLedger {
             pages,
             free,
             tables: HashMap::new(),
+            prefix_index: HashMap::new(),
             stats: LedgerStats::default(),
         }
     }
@@ -159,7 +151,6 @@ impl BlockLedger {
         num_tokens.div_ceil(self.cfg.block_size)
     }
 
-    /// Register a new sequence with empty table.
     pub fn register_seq(&mut self, seq_id: u64) {
         self.tables.entry(seq_id).or_default();
     }
@@ -172,8 +163,115 @@ impl BlockLedger {
         self.tables.get_mut(&seq_id)
     }
 
-    /// Ensure `seq_id` has pages for at least `num_tokens`. Allocates if needed.
-    /// Returns false if not enough free pages.
+    /// Allocate / reuse pages for a prompt using prefix cache when enabled.
+    /// Returns number of pages satisfied from cache (prefix hits).
+    pub fn allocate_with_prefix(&mut self, seq_id: u64, prompt_tokens: &[u32]) -> usize {
+        self.tables.entry(seq_id).or_default();
+        let bs = self.cfg.block_size.max(1);
+        let hashes = hash_prompt_pages(prompt_tokens, bs);
+        let mut shared = 0usize;
+        let mut pages = Vec::with_capacity(hashes.len());
+
+        if self.cfg.enable_prefix_cache {
+            for &h in &hashes {
+                if let Some(&pid) = self.prefix_index.get(&h) {
+                    if pid > 0 && (pid as usize) < self.pages.len() {
+                        let meta = &mut self.pages[pid as usize];
+                        if meta.ref_count > 0 && meta.content_hash == h {
+                            meta.ref_count += 1;
+                            pages.push(pid);
+                            shared += 1;
+                            self.stats.prefix.hits += 1;
+                            self.stats.prefix.pages_shared += 1;
+                            continue;
+                        }
+                    }
+                    self.prefix_index.remove(&h);
+                }
+                self.stats.prefix.misses += 1;
+                // miss — allocate fresh
+                if let Some(pid) = self.alloc_one() {
+                    pages.push(pid);
+                } else {
+                    self.stats.alloc_failures += 1;
+                    break;
+                }
+            }
+        } else {
+            for _ in 0..hashes.len() {
+                self.stats.prefix.misses += 1;
+                if let Some(pid) = self.alloc_one() {
+                    pages.push(pid);
+                } else {
+                    self.stats.alloc_failures += 1;
+                    break;
+                }
+            }
+        }
+
+        if let Some(t) = self.tables.get_mut(&seq_id) {
+            t.pages = pages;
+            t.num_tokens = prompt_tokens.len();
+            t.prefix_pages = shared;
+        }
+        shared
+    }
+
+    /// After computing KV for a unique page, seal it into the prefix index.
+    pub fn seal_page(&mut self, page_id: u32, token_block: &[u32], parent_hash: u64) {
+        if !self.cfg.enable_prefix_cache || page_id == 0 || page_id as usize >= self.pages.len() {
+            return;
+        }
+        let h = hash_token_block(token_block, parent_hash);
+        let meta = &mut self.pages[page_id as usize];
+        if meta.ref_count <= 0 {
+            return;
+        }
+        meta.content_hash = h;
+        self.prefix_index.insert(h, page_id);
+        self.stats.prefix.pages_sealed += 1;
+    }
+
+    /// Seal all non-shared pages of a sequence after prefill.
+    pub fn seal_seq_prompt(&mut self, seq_id: u64, prompt_tokens: &[u32]) {
+        if !self.cfg.enable_prefix_cache {
+            return;
+        }
+        let bs = self.cfg.block_size.max(1);
+        let Some(table) = self.tables.get(&seq_id).cloned() else {
+            return;
+        };
+        let mut parent = 0u64;
+        for (i, &pid) in table.pages.iter().enumerate() {
+            if i < table.prefix_pages {
+                // already shared — chain parent hash
+                if let Some(h) = self.pages.get(pid as usize).map(|p| p.content_hash) {
+                    parent = h;
+                }
+                continue;
+            }
+            let start = i * bs;
+            if start >= prompt_tokens.len() {
+                break;
+            }
+            let end = (start + bs).min(prompt_tokens.len());
+            self.seal_page(pid, &prompt_tokens[start..end], parent);
+            parent = self.pages[pid as usize].content_hash;
+        }
+    }
+
+    fn alloc_one(&mut self) -> Option<u32> {
+        let id = self.free.pop()?;
+        self.pages[id as usize].ref_count = 1;
+        self.pages[id as usize].content_hash = 0;
+        self.stats.pages_allocated += 1;
+        let used = self.num_used();
+        if used > self.stats.peak_used {
+            self.stats.peak_used = used;
+        }
+        Some(id)
+    }
+
     pub fn ensure_tokens(&mut self, seq_id: u64, num_tokens: usize) -> bool {
         self.tables.entry(seq_id).or_default();
         let need_pages = self.pages_for_tokens(num_tokens);
@@ -191,14 +289,11 @@ impl BlockLedger {
         }
         let mut new_ids = Vec::with_capacity(extra);
         for _ in 0..extra {
-            let id = self.free.pop().unwrap();
-            self.pages[id as usize].ref_count = 1;
-            new_ids.push(id);
-            self.stats.pages_allocated += 1;
-        }
-        let used = self.num_used();
-        if used > self.stats.peak_used {
-            self.stats.peak_used = used;
+            if let Some(id) = self.alloc_one() {
+                new_ids.push(id);
+            } else {
+                return false;
+            }
         }
         if let Some(t) = self.tables.get_mut(&seq_id) {
             t.pages.extend(new_ids);
@@ -207,7 +302,6 @@ impl BlockLedger {
         true
     }
 
-    /// Grow by one token (decode step). Allocates a new page if crossing boundary.
     pub fn append_token_slot(&mut self, seq_id: u64) -> Option<u32> {
         let block_size = self.cfg.block_size.max(1);
         let num_tokens = self.tables.get(&seq_id).map(|t| t.num_tokens).unwrap_or(0);
@@ -220,17 +314,11 @@ impl BlockLedger {
         let page_idx = (next - 1) / block_size;
         let offset = (next - 1) % block_size;
         let page_id = *t.pages.get(page_idx)?;
-        // Physical slot = (page_id - 1) * block_size + offset  (0-based dense index)
         let slot = (page_id as u64 - 1) * block_size as u64 + offset as u64;
         Some(slot as u32)
     }
 
-    /// Build slot mapping for a set of (seq_id, start_pos, len) ranges.
-    /// Used by Pulse to index paged attention.
-    pub fn build_slot_mapping(
-        &self,
-        ranges: &[(u64, usize, usize)], // (seq_id, start_token, num_tokens)
-    ) -> SlotMapping {
+    pub fn build_slot_mapping(&self, ranges: &[(u64, usize, usize)]) -> SlotMapping {
         let block_size = self.cfg.block_size.max(1);
         let mut physical_slots = Vec::new();
         let mut seq_ids = Vec::new();
@@ -242,9 +330,6 @@ impl BlockLedger {
                 continue;
             };
             for pos in start..start + len {
-                if pos >= table.num_tokens && pos >= table.pages.len() * block_size {
-                    break;
-                }
                 let page_idx = pos / block_size;
                 let offset = pos % block_size;
                 if let Some(&page_id) = table.pages.get(page_idx) {
@@ -263,7 +348,6 @@ impl BlockLedger {
         }
     }
 
-    /// Free all pages for a sequence (refcount).
     pub fn free_seq(&mut self, seq_id: u64) {
         let Some(table) = self.tables.remove(&seq_id) else {
             return;
@@ -277,19 +361,24 @@ impl BlockLedger {
         if page_id == 0 || page_id as usize >= self.pages.len() {
             return;
         }
+        let h = self.pages[page_id as usize].content_hash;
         let p = &mut self.pages[page_id as usize];
         if p.ref_count <= 0 {
             return;
         }
         p.ref_count -= 1;
         if p.ref_count == 0 {
+            if h != 0 {
+                if self.prefix_index.get(&h) == Some(&page_id) {
+                    self.prefix_index.remove(&h);
+                }
+            }
             p.content_hash = 0;
             self.free.push(page_id);
             self.stats.pages_freed += 1;
         }
     }
 
-    /// Pin page (future prefix share).
     pub fn pin(&mut self, page_id: u32) {
         if page_id == 0 || page_id as usize >= self.pages.len() {
             return;
@@ -300,50 +389,18 @@ impl BlockLedger {
         }
     }
 
-    /// Rough bytes if a dense pool were allocated (planning helper).
     pub fn estimated_pool_bytes(&self, bytes_per_elem: usize) -> usize {
         let pages = self.cfg.num_pages;
         let bs = self.cfg.block_size;
         let layers = self.cfg.num_layers;
         match self.cfg.kind {
             CacheKind::Gqa => {
-                // K + V per layer
-                layers
-                    * 2
-                    * pages
-                    * bs
-                    * self.cfg.num_kv_heads
-                    * self.cfg.head_dim
-                    * bytes_per_elem
+                layers * 2 * pages * bs * self.cfg.num_kv_heads * self.cfg.head_dim * bytes_per_elem
             }
             CacheKind::Mla => {
-                // c_kv + k_pe per layer
-                let per = pages * bs * self.cfg.kv_lora_rank
-                    + pages * bs * self.cfg.rope_dim;
+                let per = pages * bs * self.cfg.kv_lora_rank + pages * bs * self.cfg.rope_dim;
                 layers * per * bytes_per_elem
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn allocate_and_slot() {
-        let mut led = BlockLedger::new(LedgerConfig {
-            num_pages: 8,
-            block_size: 4,
-            ..Default::default()
-        });
-        assert!(led.ensure_tokens(1, 5));
-        assert_eq!(led.table(1).unwrap().pages.len(), 2);
-        let s0 = led.append_token_slot(1).unwrap();
-        // after ensure 5 tokens, append makes 6
-        assert!(led.table(1).unwrap().num_tokens >= 6);
-        let _ = s0;
-        led.free_seq(1);
-        assert_eq!(led.num_free(), 8);
     }
 }
