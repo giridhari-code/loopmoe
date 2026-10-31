@@ -2,25 +2,22 @@
 //!
 //! Continuous-batch inference runtime for LoopedMoE + Tesla.
 //!
-//! Phases:
-//! - **O1** BlockLedger — physical paged KV/MLA + slot_mapping (this module)
-//! - **O2** PackedBatch decode (B>1 one forward)
+//! - **O1** BlockLedger — physical pages + slot_mapping
+//! - **O2** PackedBatch + Pulse — single execute entry (per-seq forward today)
 //! - **O3** Chunked prefill + Tesla-in-schedule
-//! - **O4** Frontier OpenAI server on Orbit core
-//! - **O5** Prefix hash + EP collectives
-//!
-//! Layout:
-//! ```text
-//! OrbitCore
-//!   ├── OrbitSched   (time — who runs this step)
-//!   ├── BlockLedger  (space — physical pages)
-//!   └── Pulse        (execute — packed forward)  // O2+
-//! ```
+//! - **O4** Frontier server
+//! - **O5** Prefix hash + EP
 
 pub mod ledger;
 pub mod sched;
+pub mod pack;
+pub mod pulse;
+pub mod core;
 
 pub use ledger::{
-    BlockLedger, CacheKind, LedgerConfig, LedgerStats, SlotMapping, SeqBlockTable,
+    BlockLedger, CacheKind, LedgerConfig, LedgerStats, SeqBlockTable, SlotMapping,
 };
 pub use sched::OrbitSched;
+pub use pack::{PackItem, PackRole, PackedBatch};
+pub use pulse::{Pulse, PulseMetrics, PulseOutput};
+pub use core::{OrbitCore, OrbitMetrics, PackResolve};
