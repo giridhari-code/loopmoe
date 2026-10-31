@@ -4,11 +4,11 @@
 //! 1. `add_request` → waiting queue
 //! 2. `schedule()` → which seqs to run (prefill or decode)
 //! 3. `step()` → prefill / plain decode / Tesla MTP decode
-//! 4. finished sequences reaped, blocks freed
+//! 4. finished sequences reaped, blocks freed, tokens stored in `results`
 
 use std::collections::HashMap;
 
-use candle_core::{Device, Tensor, DType};
+use candle_core::{Tensor, DType};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::cache::{LayerCaches, MlaCaches, RuntimeCaches};
@@ -17,9 +17,7 @@ use crate::sampler::{is_stop, sample_token, SamplingParams};
 use crate::scheduler::{
     ContinuousScheduler, SchedulerConfig, Sequence, SequenceStatus,
 };
-use crate::tesla::{
-    draft_tokens, verify_and_accept, MtpState, TeslaConfig, TeslaStepStats,
-};
+use crate::tesla::{draft_tokens, verify_and_accept, MtpState, TeslaConfig};
 use crate::Result;
 
 struct SeqRuntime {
@@ -35,6 +33,8 @@ pub struct BatchEngine {
     scheduler: ContinuousScheduler,
     tesla: Option<TeslaConfig>,
     runtimes: HashMap<u64, SeqRuntime>,
+    /// Completed request outputs: seq_id → full token ids (prompt + gen).
+    pub results: HashMap<u64, Vec<u32>>,
     dtype: DType,
 }
 
@@ -46,13 +46,13 @@ impl BatchEngine {
         block_size: usize,
         tesla: Option<TeslaConfig>,
     ) -> Self {
-        let dtype = DType::BF16;
         Self {
             engine,
             scheduler: ContinuousScheduler::new(sched_cfg, num_gpu_blocks, block_size),
             tesla,
             runtimes: HashMap::new(),
-            dtype,
+            results: HashMap::new(),
+            dtype: DType::BF16,
         }
     }
 
@@ -137,60 +137,41 @@ impl BatchEngine {
     /// One scheduler + execute step. Returns finished sequence ids this step.
     pub fn step(&mut self) -> Result<Vec<u64>> {
         let outputs = self.scheduler.schedule();
-        if outputs.is_empty() && outputs.finished.is_empty() {
-            return Ok(Vec::new());
-        }
 
         let scheduled = outputs.scheduled.clone();
-        let prompt_run = outputs.prompt_run;
 
         for &id in &scheduled {
-            if prompt_run {
-                // May mix — check per-seq
-                let is_prompt = self
-                    .scheduler
-                    .get(id)
-                    .map(|s| s.is_prompt())
-                    .unwrap_or(false);
-                if is_prompt {
-                    self.run_prefill(id)?;
-                } else {
-                    self.run_decode(id)?;
-                }
+            let is_prompt = self
+                .scheduler
+                .get(id)
+                .map(|s| s.is_prompt())
+                .unwrap_or(false);
+            if is_prompt {
+                self.run_prefill(id)?;
             } else {
                 self.run_decode(id)?;
             }
         }
 
-        // Collect newly finished
+        // Reap anything marked finished during this step
         let mut finished = outputs.finished;
-        let ids: Vec<u64> = self.scheduler.running_ids();
-        for id in ids {
-            if let Some(seq) = self.scheduler.get(id) {
-                if seq.is_finished() {
-                    finished.push(id);
-                }
+        for id in self.scheduler.running_ids() {
+            if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(false) {
+                finished.push(id);
             }
         }
-        // Actually finish via scheduler API so blocks free
-        let mut unique = Vec::new();
+        finished.sort_unstable();
+        finished.dedup();
+
+        let mut done = Vec::new();
         for id in finished {
-            if unique.contains(&id) {
-                continue;
-            }
-            if let Some(seq) = self.scheduler.get(id) {
-                if seq.is_finished() {
-                    let status = seq.status;
-                    self.scheduler.finish_sequence(id, status);
-                    if let Some(rt) = self.runtimes.remove(&id) {
-                        // drop caches
-                        let _ = rt;
-                    }
-                    unique.push(id);
-                }
+            if let Some(seq) = self.scheduler.take_finished(id) {
+                self.results.insert(id, seq.tokens);
+                self.runtimes.remove(&id);
+                done.push(id);
             }
         }
-        Ok(unique)
+        Ok(done)
     }
 
     /// Run until all sequences finish. Returns map id → full token ids.
@@ -198,13 +179,13 @@ impl BatchEngine {
         while self.has_unfinished() {
             let _ = self.step()?;
         }
-        // Any remaining finished tokens are already removed; collect from history
-        // Callers should snapshot tokens before finish — keep a results buffer.
-        Ok(HashMap::new())
+        Ok(std::mem::take(&mut self.results))
     }
 
-    /// Snapshot current tokens for a sequence.
     pub fn tokens(&self, id: u64) -> Option<Vec<u32>> {
+        if let Some(t) = self.results.get(&id) {
+            return Some(t.clone());
+        }
         self.scheduler.get(id).map(|s| s.tokens.clone())
     }
 
@@ -267,7 +248,6 @@ impl BatchEngine {
         };
 
         let use_tesla = tesla_cfg.as_ref().map(|t| t.enabled).unwrap_or(false);
-
         if use_tesla {
             self.run_decode_tesla(id, last_token, &sampling, max_tokens, tesla_cfg.as_ref().unwrap())?;
         } else {
@@ -332,7 +312,6 @@ impl BatchEngine {
         let pos = rt.caches.current_len();
         let lens_ckpt = rt.caches.checkpoint_lens();
 
-        // --- Draft (MTP) ---
         let draft = draft_tokens(
             model,
             &mut rt.caches,
@@ -350,7 +329,6 @@ impl BatchEngine {
             draft.margins.clone(),
         );
 
-        // --- Confidence / accept-rate scheduled verify length ---
         let vlen = rt.mtp.schedule_verify_len(cfg);
 
         let (accepted, stats) = verify_and_accept(
@@ -408,13 +386,5 @@ fn squeeze_logits(logits: &Tensor) -> candle_core::Result<Tensor> {
         [1, 1, _] => logits.squeeze(0)?.squeeze(0),
         dims if dims.len() == 2 => logits.i(0),
         _ => logits.flatten_all(),
-    }
-}
-
-// Helper on ContinuousScheduler — expose running ids
-impl ContinuousScheduler {
-    pub fn running_ids(&self) -> Vec<u64> {
-        // Need access — add method in continuous.rs instead
-        Vec::new()
     }
 }

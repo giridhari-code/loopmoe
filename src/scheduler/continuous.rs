@@ -4,7 +4,6 @@
 //! - waiting / running queues
 //! - allocate blocks before admit
 //! - prefer running decode, then new prefill
-//! - preempt lowest-priority when capacity tight
 
 use super::block_manager::{AllocStatus, BlockManager};
 use super::sequence::{Sequence, SequenceStatus};
@@ -84,7 +83,10 @@ impl ContinuousScheduler {
         self.num_unfinished() > 0
     }
 
-    /// Main schedule step — returns ids of sequences to run this step.
+    pub fn running_ids(&self) -> Vec<u64> {
+        self.running.iter().map(|s| s.id).collect()
+    }
+
     pub fn schedule(&mut self) -> SchedulerOutputs {
         let mut scheduled_ids = Vec::new();
         let mut finished_ids = Vec::new();
@@ -108,7 +110,7 @@ impl ContinuousScheduler {
             if scheduled_ids.len() >= self.cfg.max_num_seqs {
                 break;
             }
-            let tokens = 1; // decode step
+            let tokens = 1;
             if num_batched_tokens + tokens > self.cfg.max_num_batched_tokens {
                 break;
             }
@@ -193,7 +195,20 @@ impl ContinuousScheduler {
             .find(|s| s.id == id)
     }
 
-    /// Mark sequence finished and free its blocks.
+    /// Take finished sequence out of running (caller already marked status).
+    /// Frees blocks. Returns the sequence if found.
+    pub fn take_finished(&mut self, id: u64) -> Option<Sequence> {
+        if let Some(pos) = self.running.iter().position(|s| s.id == id) {
+            let seq = self.running.remove(pos);
+            self.block_manager.free_many(&seq.block_table);
+            return Some(seq);
+        }
+        if let Some(pos) = self.waiting.iter().position(|s| s.id == id) {
+            return Some(self.waiting.remove(pos));
+        }
+        None
+    }
+
     pub fn finish_sequence(&mut self, id: u64, status: SequenceStatus) {
         if let Some(pos) = self.running.iter().position(|s| s.id == id) {
             let mut seq = self.running.remove(pos);
@@ -205,7 +220,6 @@ impl ContinuousScheduler {
         }
     }
 
-    /// Abort by request_id (DeepInfer-style).
     pub fn abort_request(&mut self, request_id: &str) -> usize {
         let mut n = 0;
         let mut still_running = Vec::new();
