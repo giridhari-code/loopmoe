@@ -1,7 +1,7 @@
 //! loopmoe / Sentinel — high-performance Looped-MoE inference runtime
 //!
-//! Core runtime is **Orbit**: continuous batching + BlockLedger (O1) +
-//! PackedBatch/Pulse (O2), Tesla speculative decode, Fertile/DoBu kernels.
+//! **Orbit** runtime: BlockLedger (O1) · PackedBatch/Pulse B>1 (O2/O2.1) ·
+//! chunked prefill + Tesla-in-schedule (O3).
 
 pub mod config;
 pub mod error;
@@ -42,7 +42,9 @@ pub use parallel::{
     ParallelConfig, ParallelismKind, DeviceMesh, RankInfo, ExpertParallelPlan, ExpertShard,
     AllToAllStub, DispatchMeta, CombineMeta,
 };
-pub use scheduler::{ContinuousScheduler, SchedulerConfig, Sequence, SequenceStatus};
+pub use scheduler::{
+    ContinuousScheduler, PrefillChunk, SchedulerConfig, SchedulerOutputs, Sequence, SequenceStatus,
+};
 pub use orbit::{
     BlockLedger, CacheKind, LedgerConfig, LedgerStats, OrbitCore, OrbitMetrics, OrbitSched,
     PackItem, PackResolve, PackRole, PackedBatch, Pulse, PulseMetrics, PulseOutput, SeqBlockTable,
