@@ -16,7 +16,7 @@ pub struct LoadStats {
     pub kept_assignments: usize,
     /// Assignments dropped because expert was over capacity.
     pub dropped_assignments: usize,
-    /// capacity used (same for all experts).
+    /// capacity used (same for all experts). 0 means unlimited.
     pub capacity: usize,
     /// max tokens on any expert after truncation.
     pub max_load: usize,
@@ -65,6 +65,11 @@ impl LoadStats {
             / n as f32;
         var.sqrt() / mean
     }
+
+    /// True when drop_rate > threshold or imbalance is severe — useful for adaptive capacity.
+    pub fn is_unhealthy(&self, drop_threshold: f32, imbalance_threshold: f32) -> bool {
+        self.drop_rate() > drop_threshold || self.imbalance_ratio() > imbalance_threshold
+    }
 }
 
 pub struct DeviceGroupPlan {
@@ -88,7 +93,7 @@ impl DeviceGroupPlan {
         Self::from_topk_with_capacity(topk_ids, topk_w, n_experts, scale, 0.0)
     }
 
-    /// Capacity-aware grouping.
+    /// Capacity-aware grouping (DeepSeek / Switch style).
     ///
     /// `capacity_factor <= 0.0` disables capacity (keeps all tokens).
     /// Otherwise:
@@ -147,7 +152,7 @@ impl DeviceGroupPlan {
 
         for (e, mut list) in per_expert.into_iter().enumerate() {
             if list.len() > capacity {
-                // Keep highest weight
+                // Keep highest weight (DeepSeek / Switch style)
                 list.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
                 dropped += list.len() - capacity;
                 list.truncate(capacity);
@@ -189,6 +194,7 @@ impl DeviceGroupPlan {
                 max_load,
                 min_load,
                 imbalance = %format!("{:.2}", load_stats.imbalance_ratio()),
+                cv = %format!("{:.3}", load_stats.coefficient_of_variation()),
                 "MoE capacity drop applied"
             );
         }
