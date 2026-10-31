@@ -1,41 +1,29 @@
 # Sentinel custom CUDA kernels
 
-## Source
+## Kernels (`sentinel.cu`)
 
-`sentinel.cu` — real device kernels:
-
-| Kernel | Purpose |
-|--------|---------|
-| `sentinel_silu_mul_f32` | Fused SwiGLU gate: `silu(gate) * up` |
-| `sentinel_scatter_add_rows_f32` | MoE token scatter-add |
-| `sentinel_rmsnorm_f32` | RMSNorm |
-| `sentinel_scale_f32` | Attention scale |
-| `sentinel_bias_add_f32` | Bias broadcast |
+| Kernel | f32 | f16 | bf16 |
+|--------|-----|-----|------|
+| `sentinel_silu_mul_*` | yes | yes | yes |
+| `sentinel_scale_*` | yes | yes | yes |
+| `sentinel_scatter_add_rows_*` | yes | yes | yes |
+| `sentinel_rmsnorm_f32` | yes | — | — |
 
 ## Build
 
-Requires **nvcc** on `PATH` and `--features cuda` (default):
-
 ```bash
-# optional: target your GPU
-export CUDA_COMPUTE_CAP=89   # e.g. Ada 8.9
-
-cargo build --release
-# look for: "Sentinel CUDA kernels built → .../sentinel_kernels.ptx"
+export CUDA_COMPUTE_CAP=89   # optional
+cargo build --release --features cuda
 ```
 
-Without nvcc the crate still builds; ops use Candle fallbacks.
+Needs `nvcc`. Without it → Candle fallbacks still work.
 
-## Usage
+## Wiring
 
-```rust
-use loopmoe::kernels::cuda::{silu_mul, kernels_built};
-
-// Expert FFN already calls silu_mul internally.
-assert!(kernels_built()); // true if PTX was generated
-```
+- **Expert FFN** → `silu_mul` (BF16 path used by default model dtype)
+- **Fertile** `device_scatter_add` → `scatter_add_rows` custom kernel
 
 ## Notes
 
-- First kernels are **f32**. BF16/FP16 variants are next (same `.cu` with `__half` / `__nv_bfloat16`).
-- Full GEMM stays on cuBLAS via Candle `matmul` — custom tiled GEMM is a later milestone.
+- f16/bf16 atomics use hardware `atomicAdd` on sm_70+ / sm_80+, else CAS loop.
+- Full GEMM remains cuBLAS via Candle.

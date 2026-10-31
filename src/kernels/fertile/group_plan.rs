@@ -1,5 +1,4 @@
 //! Device-side token→expert grouping for Fertile.
-//! Optimized to keep work on device and avoid large host copies when possible.
 
 use candle_core::{DType, Result as CandleResult, Tensor, D};
 
@@ -22,7 +21,6 @@ impl DeviceGroupPlan {
         let n = t * k;
         let device = topk_ids.device();
 
-        // token index for every (token, topk) slot
         let token_ids = Tensor::arange(0u32, t as u32, device)?
             .to_dtype(DType::I64)?
             .unsqueeze(1)?
@@ -73,7 +71,6 @@ impl DeviceGroupPlan {
         Ok(Some(w.to_dtype(dtype)?.unsqueeze(1)?))
     }
 
-    /// Exclusive scan of expert occupancy (useful for multi-GPU packing).
     pub fn occupancy(&self) -> &[usize] {
         &self.expert_offsets
     }
@@ -88,7 +85,6 @@ fn argsort_i64(x: &Tensor) -> CandleResult<Tensor> {
     match x2.arg_sort_last_dim(true) {
         Ok(order) => Ok(order.flatten_all()?),
         Err(_) => {
-            // CPU fallback only when device sort is unavailable
             let v = x.flatten_all()?.to_vec1::<i64>()?;
             let mut idx: Vec<i64> = (0..v.len() as i64).collect();
             idx.sort_by_key(|&i| v[i as usize]);
@@ -97,15 +93,12 @@ fn argsort_i64(x: &Tensor) -> CandleResult<Tensor> {
     }
 }
 
-/// Build exclusive prefix counts. Prefer a single host read of the sorted
-/// expert id vector (unavoidable for sparse segment boundaries in pure Candle).
 fn segment_offsets_fast(sorted_experts: &Tensor, n_experts: usize) -> CandleResult<Vec<usize>> {
     let ids = sorted_experts.flatten_all()?.to_vec1::<i64>()?;
     let mut starts = vec![0usize; n_experts + 1];
     if ids.is_empty() {
         return Ok(starts);
     }
-    // Single pass: count then prefix-sum
     let mut counts = vec![0usize; n_experts];
     for &e in &ids {
         if e >= 0 && (e as usize) < n_experts {
@@ -118,23 +111,15 @@ fn segment_offsets_fast(sorted_experts: &Tensor, n_experts: usize) -> CandleResu
     Ok(starts)
 }
 
+/// Scatter-add — prefers Sentinel custom CUDA kernel (f32/f16/bf16).
 pub fn device_scatter_add(
     base: &Tensor,
     token_indices: &Tensor,
     values: &Tensor,
 ) -> CandleResult<Tensor> {
-    let h = values.dim(1)?;
-    let n = token_indices.dims1()?;
-    let idx = token_indices
-        .to_dtype(DType::U32)?
-        .unsqueeze(1)?
-        .expand((n, h))?
-        .contiguous()?;
-    base.scatter_add(&idx, values, 0)
+    crate::kernels::cuda::scatter_add_rows(base, token_indices, values)
 }
 
-/// Top-k along the last dim (candle-core 0.8 has no `Tensor::topk`).
-/// Returns (values, indices) sorted by descending value.
 pub fn topk_last(x: &Tensor, k: usize) -> CandleResult<(Tensor, Tensor)> {
     let k = k.min(x.dim(D::Minus1)?);
     let order = x.to_dtype(DType::F32)?.contiguous()?.arg_sort_last_dim(false)?;
