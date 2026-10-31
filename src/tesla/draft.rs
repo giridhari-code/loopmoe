@@ -1,3 +1,5 @@
+//! Draft paths — **cache-free** so KV only grows on verify (not during draft).
+
 use candle_core::{Device, Result as CResult, Tensor};
 use crate::model::LoopedMoE;
 use crate::cache::RuntimeCaches;
@@ -11,7 +13,6 @@ pub struct DraftResult {
     pub tokens: Vec<u32>,
     pub confidences: Vec<f32>,
     pub margins: Vec<f32>,
-    /// True when this result came from tree search.
     pub from_tree: bool,
     pub survival: f32,
 }
@@ -41,10 +42,12 @@ fn squeeze(logits: &Tensor) -> CResult<Tensor> {
     }
 }
 
-/// Linear (chain) draft — single path.
+/// Chain draft **without** touching KV cache (`caches: None`).
+/// Token loop is data-dependent, but RAM stays flat — same idea as tree batch path.
+/// Real cache is only updated in chunk verify.
 pub fn draft_tokens_chain(
     model: &LoopedMoE,
-    caches: &mut RuntimeCaches,
+    _caches: &mut RuntimeCaches,
     start_token: u32,
     start_pos: usize,
     device: &Device,
@@ -67,7 +70,8 @@ pub fn draft_tokens_chain(
 
     for _ in 0..cfg.max_draft {
         let input = Tensor::new(&[next], device)?.unsqueeze(0)?;
-        let logits = squeeze(&model.forward(&input, pos, Some(caches))?)?;
+        // No cache — parallel-safe, no KV growth during draft
+        let logits = squeeze(&model.forward(&input, pos, None)?)?;
 
         let c = position_confidence(&logits)?;
         confidences.push(c);
@@ -92,7 +96,7 @@ pub fn draft_tokens_chain(
     })
 }
 
-/// Unified entry: tree or chain based on config.
+/// Unified entry: tree (batch parallel) or chain (cache-free sequential tokens).
 pub fn draft_tokens(
     model: &LoopedMoE,
     caches: &mut RuntimeCaches,

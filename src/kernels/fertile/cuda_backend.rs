@@ -1,13 +1,15 @@
-//! Fertile CUDA backend — device grouping + **parallel** expert GEMMs.
+//! Fertile CUDA backend — device grouping + sequential expert GEMMs.
+//!
+//! CUDA tensors are not safe to touch from multiple rayon threads (driver
+//! context). Keep expert loop single-threaded on CUDA; ARM/CPU may parallelize.
 
 use candle_core::{DType, Result as CandleResult, Tensor};
 use candle_nn::Module;
-use rayon::prelude::*;
 
 use super::dispatch::{FertileExpert, FertileMoeParams};
 use super::group_plan::{device_scatter_add, topk_last, DeviceGroupPlan};
 
-pub fn fertile_moe_cuda<E: FertileExpert + Sync>(
+pub fn fertile_moe_cuda<E: FertileExpert>(
     x_flat: &Tensor,
     gate: &impl Module,
     routed: &[E],
@@ -20,7 +22,6 @@ pub fn fertile_moe_cuda<E: FertileExpert + Sync>(
     let device = x_flat.device();
     let dtype = x_flat.dtype();
 
-    // Shared experts — accumulate (usually few; keep sequential add for stability)
     let mut out = Tensor::zeros((t, h), dtype, device)?;
     for expert in shared {
         out = (out + expert.forward(x_flat)?)?;
@@ -58,35 +59,17 @@ pub fn fertile_moe_cuda<E: FertileExpert + Sync>(
         params.routed_scaling_factor,
     )?;
 
-    // Collect active experts first (parallel-friendly work list)
-    let active: Vec<usize> = (0..plan.n_experts)
-        .filter(|&e| {
-            let (s, end) = (plan.expert_offsets[e], plan.expert_offsets[e + 1]);
-            end > s
-        })
-        .collect();
-
-    // Parallel map: each active expert runs its own gather → GEMM → weighted out
-    // Results are independent; we scatter-add sequentially only for the final reduce
-    // (scatter_add on same buffer is not data-race safe across threads).
-    let partials: Vec<CandleResult<(Tensor, Tensor)>> = active
-        .par_iter()
-        .map(|&e| {
-            let indices = plan.tokens_for(e)?.ok_or_else(|| {
-                candle_core::Error::Msg(format!("missing indices expert {e}"))
-            })?;
-            let w = plan.weights_for(e, dtype)?.ok_or_else(|| {
-                candle_core::Error::Msg(format!("missing weights expert {e}"))
-            })?;
-            let selected = x_flat.index_select(&indices, 0)?;
-            let y = routed[e].forward(&selected)?.broadcast_mul(&w)?;
-            Ok((indices, y))
-        })
-        .collect();
-
+    // Sequential on CUDA — safe with single stream / context
     let mut routed_acc = Tensor::zeros((t, h), dtype, device)?;
-    for p in partials {
-        let (indices, y) = p?;
+    for e in 0..plan.n_experts {
+        let Some(indices) = plan.tokens_for(e)? else {
+            continue;
+        };
+        let Some(w) = plan.weights_for(e, dtype)? else {
+            continue;
+        };
+        let selected = x_flat.index_select(&indices, 0)?;
+        let y = routed[e].forward(&selected)?.broadcast_mul(&w)?;
         routed_acc = device_scatter_add(&routed_acc, &indices, &y)?;
     }
 

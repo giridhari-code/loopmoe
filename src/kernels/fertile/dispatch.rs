@@ -1,4 +1,4 @@
-//! Fertile dispatch — CUDA / ARM / CPU (parallel expert backends).
+//! Fertile dispatch — CUDA (sequential) / ARM+CPU (parallel experts).
 
 use candle_core::{Result as CandleResult, Tensor};
 use candle_nn::Module;

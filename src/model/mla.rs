@@ -1,8 +1,9 @@
-//! Multi-head Latent Attention (DeepSeek MLA) — single-GPU.
+//! Multi-head Latent Attention (DeepSeek MLA) — DoBu-fused scores path.
 use candle_core::{Result as CandleResult, Tensor, D};
 use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
 use crate::config::ModelConfig;
 use crate::cache::MlaCache;
+use crate::kernels::dobu::{dobu_mla_prefill, DobuMlaParams};
 use super::layers::RmsNorm;
 use super::rope::RotaryEmbedding;
 
@@ -49,15 +50,29 @@ impl MlaAttention {
         let scale = 1.0 / ((qk_nope + qk_rope) as f64).sqrt();
 
         Ok(Self {
-            q_a_proj, q_a_layernorm, q_b_proj,
-            kv_a_proj_with_mqa: kv_a, kv_a_layernorm: kv_a_ln, kv_b_proj: kv_b, o_proj,
-            num_heads: n, qk_nope_head_dim: qk_nope, qk_rope_head_dim: qk_rope,
-            v_head_dim: v_dim, kv_lora_rank: kv_rank, rope, softmax_scale: scale,
+            q_a_proj,
+            q_a_layernorm,
+            q_b_proj,
+            kv_a_proj_with_mqa: kv_a,
+            kv_a_layernorm: kv_a_ln,
+            kv_b_proj: kv_b,
+            o_proj,
+            num_heads: n,
+            qk_nope_head_dim: qk_nope,
+            qk_rope_head_dim: qk_rope,
+            v_head_dim: v_dim,
+            kv_lora_rank: kv_rank,
+            rope,
+            softmax_scale: scale,
         })
     }
 
     pub fn forward(
-        &self, x: &Tensor, start_pos: usize, cache: Option<&mut MlaCache>, update_cache: bool,
+        &self,
+        x: &Tensor,
+        start_pos: usize,
+        cache: Option<&mut MlaCache>,
+        update_cache: bool,
     ) -> CandleResult<Tensor> {
         let (b, s, _) = x.dims3()?;
         let n = self.num_heads;
@@ -74,19 +89,28 @@ impl MlaAttention {
         };
         let q = q.reshape((b, s, n, nope + rope_d))?;
         let q_nope = q.narrow(D::Minus1, 0, nope)?.transpose(1, 2)?;
-        let q_pe = self.rope.forward(&q.narrow(D::Minus1, nope, rope_d)?.transpose(1, 2)?, start_pos)?;
+        let q_pe = self
+            .rope
+            .forward(&q.narrow(D::Minus1, nope, rope_d)?.transpose(1, 2)?, start_pos)?;
 
         let kv = self.kv_a_proj_with_mqa.forward(x)?;
         let c_kv = self.kv_a_layernorm.forward(&kv.narrow(D::Minus1, 0, rank)?)?;
-        let k_pe = self.rope.forward(&kv.narrow(D::Minus1, rank, rope_d)?.unsqueeze(1)?, start_pos)?;
+        let k_pe = self
+            .rope
+            .forward(&kv.narrow(D::Minus1, rank, rope_d)?.unsqueeze(1)?, start_pos)?;
 
         let (c_full, k_pe_full) = if let Some(cache) = cache {
             if update_cache {
                 cache.append(&c_kv, &k_pe)?;
-                (cache.c_view()?.expect("mla c"), cache.k_pe_view()?.expect("mla k_pe"))
+                (
+                    cache.c_view()?.expect("mla c"),
+                    cache.k_pe_view()?.expect("mla k_pe"),
+                )
             } else {
                 match (cache.c_view()?, cache.k_pe_view()?) {
-                    (Some(pc), Some(pk)) => (Tensor::cat(&[&pc, &c_kv], 1)?, Tensor::cat(&[&pk, &k_pe], 2)?),
+                    (Some(pc), Some(pk)) => {
+                        (Tensor::cat(&[&pc, &c_kv], 1)?, Tensor::cat(&[&pk, &k_pe], 2)?)
+                    }
                     _ => (c_kv, k_pe),
                 }
             }
@@ -95,16 +119,24 @@ impl MlaAttention {
         };
 
         let s_full = c_full.dim(1)?;
-        let kv_up = self.kv_b_proj.forward(&c_full)?.reshape((b, s_full, n, nope + v_d))?;
+        let kv_up = self
+            .kv_b_proj
+            .forward(&c_full)?
+            .reshape((b, s_full, n, nope + v_d))?;
         let k_nope = kv_up.narrow(D::Minus1, 0, nope)?.transpose(1, 2)?;
         let v = kv_up.narrow(D::Minus1, nope, v_d)?.transpose(1, 2)?;
         let k_pe_h = k_pe_full.broadcast_as((b, n, s_full, rope_d))?;
 
         let q = Tensor::cat(&[&q_nope, &q_pe], D::Minus1)?;
         let k = Tensor::cat(&[&k_nope, &k_pe_h], D::Minus1)?;
-        let att = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? * self.softmax_scale)?;
-        let att = candle_nn::ops::softmax_last_dim(&att)?;
-        let out = att.matmul(&v)?.transpose(1, 2)?.reshape((b, s, n * v_d))?;
+
+        // DoBu MLA path (explicit scale — no ambiguous default)
+        let params = DobuMlaParams {
+            causal: s > 1 && start_pos == 0,
+            softmax_scale: Some(self.softmax_scale),
+        };
+        let out = dobu_mla_prefill(&q, &k, &v, &params)?;
+        let out = out.transpose(1, 2)?.reshape((b, s, n * v_d))?;
         self.o_proj.forward(&out)
     }
 }

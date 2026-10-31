@@ -1,7 +1,4 @@
 //! DoBu MLA — FlashMLA-style interface (Candle backend).
-//!
-//! Provides prefill and KV-cache decode paths shaped like FlashMLA so a future
-//! CUDA backend can replace the bodies without changing call sites.
 
 use candle_core::{Device, Result as CResult, Tensor, D};
 
@@ -34,20 +31,29 @@ impl DobuMlaMeta {
 #[derive(Debug, Clone)]
 pub struct DobuMlaParams {
     pub causal: bool,
-    pub softmax_scale: f64,
+    /// `None` → use 1/sqrt(d) from Q last dim. Explicit value always honored.
+    pub softmax_scale: Option<f64>,
 }
 
 impl Default for DobuMlaParams {
     fn default() -> Self {
         Self {
             causal: true,
-            softmax_scale: 1.0,
+            softmax_scale: None,
         }
     }
 }
 
-/// Prefill attention: Q, K, V all present (no cache).
-/// Shapes expected: (B, H, S, D)
+fn resolve_scale(params: &DobuMlaParams, q: &Tensor) -> CResult<f64> {
+    if let Some(s) = params.softmax_scale {
+        Ok(s)
+    } else {
+        let d = q.dim(D::Minus1)? as f64;
+        Ok(1.0 / d.sqrt())
+    }
+}
+
+/// Prefill attention: Q, K, V — shapes (B, H, S, D).
 pub fn dobu_mla_prefill(
     q: &Tensor,
     k: &Tensor,
@@ -55,13 +61,7 @@ pub fn dobu_mla_prefill(
     params: &DobuMlaParams,
 ) -> CResult<Tensor> {
     let (_b, _h, s, _d) = q.dims4()?;
-    let scale = if params.softmax_scale == 1.0 {
-        // caller may leave default; use 1/sqrt(d) from last dim if possible
-        let d = q.dim(D::Minus1)? as f64;
-        1.0 / d.sqrt()
-    } else {
-        params.softmax_scale
-    };
+    let scale = resolve_scale(params, q)?;
 
     let mut att = (q.matmul(&k.transpose(D::Minus1, D::Minus2)?)? * scale)?;
     if params.causal && s > 1 {
@@ -71,8 +71,7 @@ pub fn dobu_mla_prefill(
     candle_nn::ops::softmax_last_dim(&att)?.matmul(v)
 }
 
-/// Decode / incremental attention against a KV cache.
-/// Q: (B, H, Sq, D)   K/V cache: (B, H, Skv, D)
+/// Decode against KV cache. Q: (B,H,Sq,D)  K/V: (B,H,Skv,D)
 pub fn dobu_mla_with_kvcache(
     q: &Tensor,
     k_cache: &Tensor,
@@ -91,11 +90,9 @@ pub fn dobu_mla_with_kvcache(
     candle_nn::ops::softmax_last_dim(&att)?.matmul(v_cache)
 }
 
-/// Causal mask: -inf above the diagonal (aligned to the end of the KV sequence).
 fn causal_mask(q_len: usize, kv_len: usize, device: &Device) -> CResult<Tensor> {
     let mut mask = vec![0f32; q_len * kv_len];
     for i in 0..q_len {
-        // Keys that are "in the future" relative to this query position.
         let max_key = kv_len.saturating_sub(q_len).saturating_add(i);
         for j in (max_key + 1)..kv_len {
             mask[i * kv_len + j] = f32::NEG_INFINITY;
