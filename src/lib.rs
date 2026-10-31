@@ -1,12 +1,16 @@
-//! loopmoe / Sentinel v1.0 — high-performance inference runtime
+//! loopmoe / Sentinel — high-performance Looped-MoE inference runtime
 //!
-//! Professional modular layout:
-//! - `server`      OpenAI-compatible HTTP + SSE (requires `server` feature)
-//! - `scheduler`   continuous batching + paged KV
-//! - `engine`      InferenceEngine + BatchEngine (multi-request)
-//! - `model`       Looped-MoE + future Llama/Qwen
+//! Core runtime is **Orbit**: continuous batching + physical BlockLedger (O1),
+//! Tesla speculative decode, Fertile/DoBu kernels.
+//!
+//! Modules:
+//! - `orbit`       BlockLedger · OrbitSched · (Pulse O2+)
+//! - `scheduler`   continuous batch queues (used by OrbitSched)
+//! - `engine`      InferenceEngine + BatchEngine
+//! - `model`       LoopedMoE
 //! - `kernels`     Fertile / DoBu / CUDA
-//! - `utils`       tokenizer, logging
+//! - `tesla`       MTP / tree speculative
+//! - `server`      OpenAI HTTP (feature `server`)
 
 pub mod config;
 pub mod error;
@@ -14,6 +18,7 @@ pub mod error;
 #[cfg(feature = "server")]
 pub mod server;
 
+pub mod orbit;
 pub mod scheduler;
 pub mod engine;
 pub mod model;
@@ -47,5 +52,8 @@ pub use parallel::{
     AllToAllStub, DispatchMeta, CombineMeta,
 };
 pub use scheduler::{ContinuousScheduler, SchedulerConfig, Sequence, SequenceStatus};
+pub use orbit::{
+    BlockLedger, CacheKind, LedgerConfig, LedgerStats, OrbitSched, SeqBlockTable, SlotMapping,
+};
 
 pub type Result<T> = anyhow::Result<T>;
