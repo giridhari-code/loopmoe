@@ -28,7 +28,6 @@ __device__ __forceinline__ unsigned char float_to_fp8_e4m3(float x) {
     if (isnan(x)) return 0x7F; // NaN pattern
     int sign = x < 0.f ? 1 : 0;
     x = fabsf(x);
-    if (isinf(x)) return (unsigned char)((sign << 7) | 0x7E);
     if (x == 0.f) return (unsigned char)(sign << 7);
     // Clamp to max E4M3 finite ≈ 448
     if (x > 448.f) x = 448.f;

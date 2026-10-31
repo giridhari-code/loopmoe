@@ -355,12 +355,6 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
 
     let (t, h) = base.dims2()?;
     let n = indices.dims1()?;
-    if n == 0 || h == 0 || t == 0 {
-        candle_core::bail!("scatter dimensions must be non-zero");
-    }
-    if n > u32::MAX as usize || h > u32::MAX as usize || t > u32::MAX as usize {
-        candle_core::bail!("scatter dimension exceeds CUDA kernel limit");
-    }
     if values.dims() != [n, h] {
         candle_core::bail!("values shape must be (n, h)");
     }
@@ -369,6 +363,20 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
     let out = base.contiguous()?;
     let idx_i32 = indices.to_dtype(DType::I32)?.contiguous()?;
     let vals = values.contiguous()?;
+
+    // Launch via a dummy CustomOp1 on `out` is awkward; use apply_op1 with closure data.
+    // Direct path: force cuda storage access through a tiny CustomOp1 that only needs out.
+    // We embed n,h and use thread-local... no.
+    //
+    // Practical approach: use Candle scatter for correctness if we cannot get three slices.
+    // Try launching through SiluMul-style by packing — for now call through
+    // `out.apply_op2_no_bwd(vals, &ScatterPair { ...})` won't get indices.
+    //
+    // Use Tensor::from + internal: fall back to candle scatter_add which IS a CUDA kernel
+    // in Candle, then additionally document our kernel for future CustomOp3.
+    //
+    // Attempt CustomOp2(out, vals) where indices live in Arc inside op — indices must be
+    // CudaStorage. We'll clone indices into the op as Tensor (reference counted).
 
     struct ScatterPair {
         idx: Tensor,
@@ -432,9 +440,9 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                     dev.dtod_copy(&src.slice(0..n_elem), &dst).w()?;
                     let val = s_val.as_cuda_slice::<f32>()?.slice(l_val.start_offset()..);
                     let mut b = func.builder();
-                    b.arg(&dst);
-                    b.arg(&idx_slice);
                     b.arg(&val);
+                    b.arg(&idx_slice);
+                    b.arg(&dst);
                     b.arg(&self.n);
                     b.arg(&self.h);
                     b.arg(&self.out_rows);
@@ -450,9 +458,9 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                     dev.dtod_copy(&src.slice(0..n_elem), &dst).w()?;
                     let val = s_val.as_cuda_slice::<half::f16>()?.slice(l_val.start_offset()..);
                     let mut b = func.builder();
-                    b.arg(&dst);
-                    b.arg(&idx_slice);
                     b.arg(&val);
+                    b.arg(&idx_slice);
+                    b.arg(&dst);
                     b.arg(&self.n);
                     b.arg(&self.h);
                     b.arg(&self.out_rows);
@@ -468,9 +476,9 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                     dev.dtod_copy(&src.slice(0..n_elem), &dst).w()?;
                     let val = s_val.as_cuda_slice::<half::bf16>()?.slice(l_val.start_offset()..);
                     let mut b = func.builder();
-                    b.arg(&dst);
-                    b.arg(&idx_slice);
                     b.arg(&val);
+                    b.arg(&idx_slice);
+                    b.arg(&dst);
                     b.arg(&self.n);
                     b.arg(&self.h);
                     b.arg(&self.out_rows);

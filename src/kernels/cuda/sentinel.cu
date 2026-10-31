@@ -66,7 +66,7 @@ extern "C" __global__ void sentinel_scale_bf16(
 // ===================== scatter_add_rows =====================
 
 extern "C" __global__ void sentinel_scatter_add_rows_f32(
-    float *out, const int *idx, const float *values,
+    const float *values, const int *idx, float *out,
     unsigned int n, unsigned int h, unsigned int out_rows
 ) {
     unsigned int row = blockIdx.x;
@@ -93,7 +93,7 @@ __device__ __forceinline__ void atomicAddHalf(__half *addr, __half val) {
 }
 
 extern "C" __global__ void sentinel_scatter_add_rows_f16(
-    __half *out, const int *idx, const __half *values,
+    const __half *values, const int *idx, __half *out,
     unsigned int n, unsigned int h, unsigned int out_rows
 ) {
     unsigned int row = blockIdx.x;
@@ -121,7 +121,7 @@ __device__ __forceinline__ void atomicAddBf16(__nv_bfloat16 *addr, __nv_bfloat16
 }
 
 extern "C" __global__ void sentinel_scatter_add_rows_bf16(
-    __nv_bfloat16 *out, const int *idx, const __nv_bfloat16 *values,
+    const __nv_bfloat16 *values, const int *idx, __nv_bfloat16 *out,
     unsigned int n, unsigned int h, unsigned int out_rows
 ) {
     unsigned int row = blockIdx.x;
