@@ -1,15 +1,12 @@
-mod attention;
-mod layers;
-mod moe;
-mod mla;
-mod looped_moe;
+//! Model architectures + weight loading
+
+pub mod loader;
+pub mod llama;
+pub mod qwen;
+pub mod attention;
+pub mod mlp;
 pub mod rope;
+pub mod quantization;
 
-pub use attention::*;
-pub use layers::*;
-pub use moe::*;
-pub use mla::*;
-pub use looped_moe::LoopedMoE;
-pub use rope::RotaryEmbedding;
-
-pub type SentinelV1 = LoopedMoE;
+// Existing specialized models kept for now
+// pub mod looped_moe; etc. live under the old paths
