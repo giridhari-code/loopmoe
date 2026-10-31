@@ -3,9 +3,11 @@
 //! Real implementation will call DeepEP / NCCL. For now we provide:
 //! - Single-rank identity (no communication)
 //! - Metadata structures matching typical EP all-to-all layouts
+//! - Hooks for capacity-aware load stats from Fertile
 
 use candle_core::{Result as CandleResult, Tensor};
 use super::expert_parallel::ExpertParallelPlan;
+use crate::kernels::fertile::LoadStats;
 
 /// Metadata produced by dispatch (token packing per expert / rank).
 #[derive(Debug, Clone)]
@@ -16,6 +18,8 @@ pub struct DispatchMeta {
     pub offsets: Vec<usize>,
     /// Optional expert ids for the packed stream.
     pub expert_ids: Option<Vec<i32>>,
+    /// Optional load stats from capacity-aware grouping (for monitoring).
+    pub load_stats: Option<LoadStats>,
 }
 
 impl DispatchMeta {
@@ -24,7 +28,13 @@ impl DispatchMeta {
             tokens_per_rank: vec![n_tokens],
             offsets: vec![0, n_tokens],
             expert_ids: None,
+            load_stats: None,
         }
+    }
+
+    pub fn with_load_stats(mut self, stats: LoadStats) -> Self {
+        self.load_stats = Some(stats);
+        self
     }
 }
 
