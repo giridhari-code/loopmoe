@@ -1,6 +1,7 @@
 //! Sampling: greedy / temperature / top-k / top-p.
 use candle_core::{DType, Result as CandleResult, Tensor, D};
 use rand::Rng;
+use std::cmp::Ordering;
 
 #[derive(Debug, Clone)]
 pub struct SamplingParams {
@@ -31,6 +32,15 @@ impl SamplingParams {
     }
 }
 
+/// Descending f32 compare; NaN treated as Less so sort is total.
+#[inline]
+fn cmp_f32_desc(a: f32, b: f32) -> Ordering {
+    match b.partial_cmp(&a) {
+        Some(o) => o,
+        None => Ordering::Less,
+    }
+}
+
 pub fn sample_token(
     logits: &Tensor,
     params: &SamplingParams,
@@ -46,8 +56,11 @@ pub fn sample_token(
         for &id in generated {
             let i = id as usize;
             if i < v.len() {
-                if v[i] > 0.0 { v[i] /= params.repetition_penalty as f32; }
-                else { v[i] *= params.repetition_penalty as f32; }
+                if v[i] > 0.0 {
+                    v[i] /= params.repetition_penalty as f32;
+                } else {
+                    v[i] *= params.repetition_penalty as f32;
+                }
             }
         }
         logits = Tensor::from_vec(v, logits.dims(), logits.device())?;
@@ -60,44 +73,66 @@ pub fn sample_token(
     if let Some(k) = params.top_k {
         if k > 0 && k < n {
             let mut idx: Vec<usize> = (0..n).collect();
-            idx.select_nth_unstable_by(k, |&a, &b| {
-                v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal)
-            });
+            idx.select_nth_unstable_by(k, |&a, &b| cmp_f32_desc(v[a], v[b]));
             let thresh = v[idx[k - 1]];
             for x in v.iter_mut() {
-                if *x < thresh { *x = f32::NEG_INFINITY; }
+                if *x < thresh {
+                    *x = f32::NEG_INFINITY;
+                }
             }
         }
     }
     let t = params.temperature as f32;
-    for x in v.iter_mut() { *x /= t; }
+    for x in v.iter_mut() {
+        *x /= t;
+    }
     let max = v.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let mut sum = 0f32;
-    for x in v.iter_mut() { *x = (*x - max).exp(); sum += *x; }
-    if sum > 0.0 { for x in v.iter_mut() { *x /= sum; } }
+    for x in v.iter_mut() {
+        *x = (*x - max).exp();
+        sum += *x;
+    }
+    if sum > 0.0 {
+        for x in v.iter_mut() {
+            *x /= sum;
+        }
+    }
     if let Some(p) = params.top_p {
         if p > 0.0 && p < 1.0 {
             let mut idx: Vec<usize> = (0..n).collect();
-            idx.sort_by(|&a, &b| v[b].partial_cmp(&v[a]).unwrap_or(std::cmp::Ordering::Equal));
+            idx.sort_by(|&a, &b| cmp_f32_desc(v[a], v[b]));
             let mut cum = 0f32;
             let mut cutoff = n;
             for (rank, &i) in idx.iter().enumerate() {
                 cum += v[i];
-                if cum >= p as f32 { cutoff = rank + 1; break; }
+                if cum >= p as f32 {
+                    cutoff = rank + 1;
+                    break;
+                }
             }
             let keep: std::collections::HashSet<usize> = idx[..cutoff].iter().copied().collect();
             let mut new_sum = 0f32;
             for (i, x) in v.iter_mut().enumerate() {
-                if !keep.contains(&i) { *x = 0.0; } else { new_sum += *x; }
+                if !keep.contains(&i) {
+                    *x = 0.0;
+                } else {
+                    new_sum += *x;
+                }
             }
-            if new_sum > 0.0 { for x in v.iter_mut() { *x /= new_sum; } }
+            if new_sum > 0.0 {
+                for x in v.iter_mut() {
+                    *x /= new_sum;
+                }
+            }
         }
     }
     let r: f32 = rng.gen();
     let mut cum = 0f32;
     for (i, &p) in v.iter().enumerate() {
         cum += p;
-        if r <= cum { return Ok(i as u32); }
+        if r <= cum {
+            return Ok(i as u32);
+        }
     }
     Ok((n - 1) as u32)
 }
