@@ -1,105 +1,104 @@
 # loopmoe
 
-High-performance MoE + Looped Transformer inference framework in pure Rust.  
-GPU-first (CUDA) with CPU fallback. Safetensors support.
+**High-performance MoE + Looped Transformer inference in pure Rust.**  
+GPU-first (CUDA) · CPU fallback · Safetensors · OpenAI-compatible API
 
-> **Professional structure** (inspired by production inference engines)
+---
 
-```
-loopmoe/
-├── Cargo.toml
-├── src/
-│   ├── main.rs                    # server bootstrap
-│   ├── lib.rs
-│   ├── config.rs                  # ModelConfig, ServerConfig
-│   ├── error.rs                   # unified Error enum
-│   │
-│   ├── server/
-│   │   ├── mod.rs
-│   │   ├── routes.rs              # /v1/completions, /v1/chat/completions
-│   │   ├── openai_types.rs        # request/response structs
-│   │   ├── sse.rs                 # streaming
-│   │   └── middleware.rs          # auth, rate-limit, logging
-│   │
-│   ├── scheduler/
-│   │   ├── mod.rs
-│   │   ├── continuous.rs          # continuous batching scheduler
-│   │   ├── sequence.rs            # Sequence { id, tokens, state, ... }
-│   │   └── block_manager.rs       # paged KV-cache block allocator
-│   │
-│   ├── engine/
-│   │   ├── mod.rs
-│   │   ├── executor.rs            # runs forward pass on batch
-│   │   ├── sampler.rs             # top-k, top-p, temperature, repetition penalty
-│   │   ├── stop_criteria.rs       # EOS, max_tokens, stop strings
-│   │   └── metrics.rs             # tokens/sec, latency, queue depth
-│   │
-│   ├── model/
-│   │   ├── mod.rs
-│   │   ├── loader.rs              # safetensors → weights
-│   │   ├── llama.rs               # Llama architecture
-│   │   ├── qwen.rs                # Qwen architecture
-│   │   ├── attention.rs           # PagedAttention kernel launcher
-│   │   ├── mlp.rs                 # SwiGLU
-│   │   ├── rope.rs                # rotary embeddings
-│   │   └── quantization.rs        # FP8/INT8/AWQ loaders
-│   │
-│   ├── kernels/                   # CUDA kernels (Rust bindings)
-│   │   ├── mod.rs
-│   │   ├── paged_attention.rs
-│   │   ├── rmsnorm.rs
-│   │   ├── rope.rs
-│   │   ├── silu_mul.rs
-│   │   ├── gemm_fp8.rs
-│   │   └── cuda/
-│   │       ├── mod.rs
-│   │       ├── build.rs
-│   │       ├── paged_attention.cu
-│   │       ├── rmsnorm.cu
-│   │       ├── rope.cu
-│   │       ├── silu_mul.cu
-│   │       └── gemm_fp8.cu
-│   │
-│   └── utils/
-│       ├── mod.rs
-│       ├── tokenizer.rs
-│       └── logger.rs
-│
-├── tests/
-│   ├── integration_server.rs
-│   ├── test_scheduler.rs
-│   └── test_kv_cache.rs
-│
-├── benches/
-│   └── throughput.rs
-│
-├── examples/
-│   ├── simple_completion.rs
-│   └── chat_stream.rs
-│
-├── Dockerfile
-├── README.md
-└── config/
-    └── default.toml
-```
+## Features
 
-## Status
+| Area | Capability |
+|------|------------|
+| **Architecture** | Looped MoE (Sentinel v1.0), MLA, GQA |
+| **Kernels** | Fertile (MoE dispatch), DoBu (GEMM/MLA/FP8), custom CUDA |
+| **Decoding** | Tesla speculative decoding (parallel tree + chain) |
+| **Parallelism** | Expert Parallel / Tensor Parallel / Data Parallel mesh |
+| **Serving** | OpenAI-compatible `/v1/chat/completions` (feature `server`) |
+| **Training** | Pretrain · SFT · DPO · Mid-train pipelines |
+| **Runtime** | Continuous-batching scheduler skeleton · Paged KV · Metrics |
 
-- **Scaffold complete** on branch `professional-structure`
-- Existing specialized code (Looped-MoE, Tesla, Fertile, DoBu, training, recipe) is still present and will be gradually migrated into the new modules.
-- New modules are currently placeholders ready for implementation.
+---
 
-## Quick start (legacy)
+## Quick Start
 
 ```bash
-cargo run --release --bin sentinel -- --model ./weights --prompt "Hi" --tesla
+# Inference (Tesla speculative decoding)
+cargo run --release --bin sentinel -- \
+  --model ./weights \
+  --prompt "Hello" \
+  --tesla --tesla-k 4
+
+# OpenAI-compatible server
+cargo run --release --bin sentinel-server --features server -- \
+  --model ./weights --port 8080
+
+# Training
+cargo run --release --bin sentinel-train -- --config configs/train_sft.json
 ```
 
-## Server (when wired)
+---
+
+## Project Layout
+
+```
+src/
+├── main.rs / bin/          # CLI entrypoints
+├── config.rs              # ModelConfig · ServerConfig
+├── error.rs
+│
+├── engine/                # InferenceEngine + executor / sampler / metrics
+├── model/                 # LoopedMoE · attention · MLA · MoE · RoPE
+├── kernels/               # Fertile · DoBu · CUDA · CPU backends
+├── scheduler/             # Continuous batching · Sequence · BlockManager
+├── server/                # OpenAI routes · SSE · middleware  (feature = "server")
+├── cache/                 # GQA / MLA KV-cache
+├── tesla/                 # Speculative decoding (tree + verify)
+├── parallel/              # Device mesh · EP / TP / DP
+├── recipe/                # Chat templates · OpenAI types
+├── train/                 # Pretrain / SFT / DPO
+├── sampler.rs · tokenizer.rs
+└── utils/
+```
+
+---
+
+## Configuration
+
+Default model config lives in `configs/sentinel-v1.0.json`.  
+Server defaults in `config/default.toml`.
+
+```toml
+[server]
+host = "0.0.0.0"
+port = 8000
+max_num_seqs = 256
+max_num_batched_tokens = 8192
+```
+
+---
+
+## Build Features
+
+| Feature | Description |
+|---------|-------------|
+| `cuda` (default) | NVIDIA GPU path via Candle + custom kernels |
+| `server` | Axum HTTP server + OpenAI endpoints |
+| `cpu` / `arm` | CPU / ARM backends |
 
 ```bash
-cargo run --release --bin sentinel-server --features server
+cargo build --release --features server,cuda
 ```
+
+---
+
+## Docker
+
+```bash
+docker build -t loopmoe .
+docker run --gpus all -p 8000:8000 loopmoe
+```
+
+---
 
 ## License
 
