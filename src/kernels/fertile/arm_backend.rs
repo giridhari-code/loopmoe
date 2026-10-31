@@ -48,11 +48,12 @@ pub fn fertile_moe_arm<E: FertileExpert + Sync>(
         candle_nn::ops::softmax_last_dim(&topk_w)?
     };
 
-    let plan = DeviceGroupPlan::from_topk(
+    let plan = DeviceGroupPlan::from_topk_with_capacity(
         &topk_ids,
         &topk_w,
         routed.len(),
         params.routed_scaling_factor,
+        params.capacity_factor,
     )?;
 
     let active: Vec<usize> = (0..plan.n_experts)
