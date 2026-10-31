@@ -1,10 +1,4 @@
-//! Continuous batching scheduler — optimized
-//!
-//! Patterns from DeepInfer `Scheduler`:
-//! - waiting / running queues
-//! - allocate blocks before admit
-//! - prefer decode, then prefill (shortest first)
-//! - preempt longest seq when capacity tight
+//! Continuous batching scheduler — optimized + borrow-safe
 
 use super::block_manager::{AllocStatus, BlockManager};
 use super::sequence::{Sequence, SequenceStatus};
@@ -13,9 +7,7 @@ use super::sequence::{Sequence, SequenceStatus};
 pub struct SchedulerConfig {
     pub max_num_seqs: usize,
     pub max_num_batched_tokens: usize,
-    /// When true, admit waiting prompts shortest-first (better packing).
     pub shortest_first: bool,
-    /// Enable preemption of longest running seq when blocks run out.
     pub enable_preempt: bool,
 }
 
@@ -32,12 +24,9 @@ impl Default for SchedulerConfig {
 
 #[derive(Debug, Default)]
 pub struct SchedulerOutputs {
-    /// Sequences that need a prefill this step.
     pub prefill_ids: Vec<u64>,
-    /// Sequences that need a decode this step.
     pub decode_ids: Vec<u64>,
     pub num_batched_tokens: usize,
-    /// Already reaped (blocks freed) before this step ran.
     pub finished: Vec<u64>,
     pub preempted: Vec<u64>,
 }
@@ -45,10 +34,6 @@ pub struct SchedulerOutputs {
 impl SchedulerOutputs {
     pub fn is_empty(&self) -> bool {
         self.prefill_ids.is_empty() && self.decode_ids.is_empty()
-    }
-
-    pub fn scheduled_ids(&self) -> impl Iterator<Item = u64> + '_ {
-        self.prefill_ids.iter().chain(self.decode_ids.iter()).copied()
     }
 
     pub fn num_scheduled(&self) -> usize {
@@ -62,7 +47,6 @@ pub struct ContinuousScheduler {
     waiting: Vec<Sequence>,
     running: Vec<Sequence>,
     next_id: u64,
-    /// Cumulative stats
     pub stats: SchedulerStats,
 }
 
@@ -130,7 +114,6 @@ impl ContinuousScheduler {
         self.running.len()
     }
 
-    /// Decode token budget estimate (Tesla may accept >1 token per step).
     #[inline]
     fn decode_token_estimate(seq: &Sequence) -> usize {
         seq.draft_len.unwrap_or(1).max(1)
@@ -153,61 +136,85 @@ impl ContinuousScheduler {
         }
         self.running = still;
 
-        let mut num_tokens = 0usize;
         let max_seqs = self.cfg.max_num_seqs;
         let max_tok = self.cfg.max_num_batched_tokens;
+        let mut num_tokens = 0usize;
 
-        // ── 2. Schedule decode (running, non-prompt) ──────────────────────
-        for seq in self.running.iter_mut() {
+        // ── 2. Phase A: decide which running seqs decode, collect block needs ─
+        // Avoid mut borrow of running while preempting.
+        let mut decode_candidates: Vec<(u64, usize, usize)> = Vec::new();
+        // (id, est_tokens, extra_blocks_needed)
+        for seq in &self.running {
             if seq.is_prompt() {
-                // still in prefill phase of first step after admit — rare
                 continue;
             }
-            if out.decode_ids.len() + out.prefill_ids.len() >= max_seqs {
-                break;
-            }
             let est = Self::decode_token_estimate(seq);
-            if num_tokens + est > max_tok && !out.decode_ids.is_empty() {
-                break;
-            }
-            // Ensure room for growth
             let need = self
                 .block_manager
                 .blocks_for_tokens(seq.len() + est)
                 .saturating_sub(seq.block_table.len());
+            decode_candidates.push((seq.id, est, need));
+        }
+
+        let mut selected_decode: Vec<u64> = Vec::new();
+        for (id, est, need) in decode_candidates {
+            if selected_decode.len() >= max_seqs {
+                break;
+            }
+            if num_tokens + est > max_tok && !selected_decode.is_empty() {
+                break;
+            }
             if need > 0 {
-                if !self.try_allocate_or_preempt(seq, need, &mut out) {
-                    continue;
+                match self.block_manager.can_allocate(need) {
+                    AllocStatus::Ok => {
+                        if let Some(extra) = self.block_manager.allocate(need) {
+                            if let Some(seq) = self.running.iter_mut().find(|s| s.id == id) {
+                                seq.block_table.extend(extra);
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    AllocStatus::Later if self.cfg.enable_preempt => {
+                        // Preempt someone else, then retry allocate
+                        if !self.preempt_one_except(id, &mut out) {
+                            continue;
+                        }
+                        if let Some(extra) = self.block_manager.allocate(need) {
+                            if let Some(seq) = self.running.iter_mut().find(|s| s.id == id) {
+                                seq.block_table.extend(extra);
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    _ => continue,
                 }
             }
-            out.decode_ids.push(seq.id);
+            selected_decode.push(id);
             num_tokens += est;
             self.stats.total_decodes_scheduled += 1;
         }
+        out.decode_ids = selected_decode;
 
-        // ── 3. Admit prefills (shortest-first optional) ───────────────────
+        // ── 3. Admit prefills (shortest-first) ────────────────────────────
         if self.cfg.shortest_first && self.waiting.len() > 1 {
-            self.waiting
-                .sort_by_key(|s| s.prompt_len); // ascending
+            self.waiting.sort_by_key(|s| s.prompt_len);
         }
 
         let mut admitted = Vec::new();
         let mut waiting_keep = Vec::with_capacity(self.waiting.len());
 
         for mut seq in self.waiting.drain(..) {
-            let slots_used = self.running.len() + admitted.len() + out.decode_ids.len();
-            if slots_used >= max_seqs {
+            let slots = self.running.len() + admitted.len() + out.decode_ids.len();
+            if slots >= max_seqs {
                 waiting_keep.push(seq);
                 continue;
             }
             let prompt_tokens = seq.prompt_len.max(1);
-            if num_tokens + prompt_tokens > max_tok && !out.decode_ids.is_empty() && admitted.is_empty()
+            if num_tokens + prompt_tokens > max_tok
+                && (!out.decode_ids.is_empty() || !admitted.is_empty())
             {
-                // Prefer finishing decode-only step; defer long prefills
-                waiting_keep.push(seq);
-                continue;
-            }
-            if num_tokens + prompt_tokens > max_tok && !admitted.is_empty() {
                 waiting_keep.push(seq);
                 continue;
             }
@@ -226,9 +233,8 @@ impl ContinuousScheduler {
                         waiting_keep.push(seq);
                     }
                 }
-                AllocStatus::Later => {
-                    // Try preemption once
-                    if self.cfg.enable_preempt && self.preempt_one(&mut out) {
+                AllocStatus::Later if self.cfg.enable_preempt => {
+                    if self.preempt_one(&mut out) {
                         if let Some(blocks) = self.block_manager.allocate(need) {
                             seq.block_table = blocks;
                             seq.status = SequenceStatus::Running;
@@ -236,16 +242,19 @@ impl ContinuousScheduler {
                             out.prefill_ids.push(seq.id);
                             admitted.push(seq);
                             self.stats.total_prefills_admitted += 1;
-                            continue;
+                        } else {
+                            waiting_keep.push(seq);
                         }
+                    } else {
+                        waiting_keep.push(seq);
                     }
-                    waiting_keep.push(seq);
                 }
                 AllocStatus::Never => {
                     seq.finish(SequenceStatus::FinishedIgnored);
                     out.finished.push(seq.id);
                     self.stats.total_finished += 1;
                 }
+                _ => waiting_keep.push(seq),
             }
         }
         self.waiting = waiting_keep;
@@ -255,43 +264,13 @@ impl ContinuousScheduler {
         out
     }
 
-    /// Allocate `need` blocks for `seq`, preempting if necessary.
-    fn try_allocate_or_preempt(
-        &mut self,
-        seq: &mut Sequence,
-        need: usize,
-        out: &mut SchedulerOutputs,
-    ) -> bool {
-        match self.block_manager.can_allocate(need) {
-            AllocStatus::Ok => {
-                if let Some(extra) = self.block_manager.allocate(need) {
-                    seq.block_table.extend(extra);
-                    true
-                } else {
-                    false
-                }
-            }
-            AllocStatus::Later if self.cfg.enable_preempt => {
-                // Don't preempt ourselves — only others
-                if self.preempt_one_except(seq.id, out) {
-                    if let Some(extra) = self.block_manager.allocate(need) {
-                        seq.block_table.extend(extra);
-                        return true;
-                    }
-                }
-                false
-            }
-            _ => false,
-        }
-    }
-
-    /// Preempt the longest running sequence (most KV pressure).
     fn preempt_one(&mut self, out: &mut SchedulerOutputs) -> bool {
         self.preempt_one_except(u64::MAX, out)
     }
 
+    /// Preempt longest running seq (not `except_id`). Safe: no live iterators.
     fn preempt_one_except(&mut self, except_id: u64, out: &mut SchedulerOutputs) -> bool {
-        let mut best: Option<(usize, usize)> = None; // (idx, len)
+        let mut best: Option<(usize, usize)> = None;
         for (i, seq) in self.running.iter().enumerate() {
             if seq.id == except_id || seq.is_finished() {
                 continue;
@@ -305,7 +284,6 @@ impl ContinuousScheduler {
             return false;
         };
         let mut seq = self.running.swap_remove(idx);
-        // Remove from decode list if present
         out.decode_ids.retain(|&id| id != seq.id);
         seq.finish(SequenceStatus::FinishedPreempted);
         self.block_manager.free_many(&seq.block_table);

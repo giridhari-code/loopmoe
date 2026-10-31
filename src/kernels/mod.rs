@@ -1,7 +1,5 @@
 //! Fertile (MoE) + DoBu (GEMM + MLA + FP8) + custom CUDA kernels
-//! + new paged-attention / rmsnorm / silu_mul placeholders.
 
-// ── Existing production kernels ─────────────────────────────────────────────
 pub mod fertile;
 pub mod dobu;
 pub mod cuda;
@@ -20,13 +18,13 @@ pub use dobu::{
 
 pub use cuda::{
     kernels_built, kernels_available, fp8_kernels_built, silu_mul, scale_mul, scatter_add_rows,
-    tiled_gemm_nn, tiled_gemm_nt, quantize_to_fp8_e4m3, dequant_fp8_e4m3, gemm_nn_fp8_weight,
+    residual_add, rmsnorm, tiled_gemm_nn, tiled_gemm_nt, quantize_to_fp8_e4m3, dequant_fp8_e4m3,
+    gemm_nn_fp8_weight,
 };
 
-// ── New kernel placeholders (paged-attention path)
-// Named distinctly to avoid clashing with existing cuda::silu_mul / rmsnorm re-exports.
+// New paged-attention placeholders (names avoid clash with cuda re-exports)
 pub mod paged_attention;
-pub mod rmsnorm_paged;   // was rmsnorm.rs – avoid name clash with cuda::rmsnorm
-pub mod rope_paged;     // was rope.rs
-pub mod silu_mul_fused; // was silu_mul.rs
+pub mod rmsnorm_paged;
+pub mod rope_paged;
+pub mod silu_mul_fused;
 pub mod gemm_fp8;
