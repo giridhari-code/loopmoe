@@ -26,7 +26,7 @@ pub mod tokenizer;
 
 pub use config::{ModelConfig, ServerConfig};
 pub use engine::{BatchEngine, InferenceEngine};
-pub use model::{LoopedMoE, SentinelV1};
+pub use model::{InferModel, LoopedMoE, SentinelV1, WeightLoader, WeightPaths, WeightSource};
 pub use cache::{
     KvCache, LayerCaches, MlaCache, MlaCaches, RuntimeCaches, kv_bytes_estimate, mla_bytes_estimate,
 };

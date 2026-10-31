@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use crate::{
     config::ModelConfig,
-    model::LoopedMoE,
+    model::{LoopedMoE, WeightLoader},
     cache::{
         kv_bytes_estimate, mla_bytes_estimate, LayerCaches, MlaCaches, RuntimeCaches,
     },
@@ -55,24 +55,7 @@ impl InferenceEngine {
         tracing::info!(fertile_backend = %backend.kind, "Fertile kernel backend");
 
         let dtype = DType::BF16;
-        let weights_path = model_path.as_ref();
-        let vb = if weights_path.is_dir() {
-            unsafe {
-                candle_nn::VarBuilder::from_mmaped_safetensors(
-                    &[weights_path.join("model.safetensors")],
-                    dtype,
-                    mesh.device(),
-                )?
-            }
-        } else {
-            unsafe {
-                candle_nn::VarBuilder::from_mmaped_safetensors(
-                    &[weights_path.to_path_buf()],
-                    dtype,
-                    mesh.device(),
-                )?
-            }
-        };
+        let vb = WeightLoader::var_builder(model_path.as_ref(), dtype, mesh.device())?;
         let model = LoopedMoE::load(vb, &config, mesh.device())?;
 
         let ep_plan = if mesh.is_single() {
@@ -162,10 +145,6 @@ impl InferenceEngine {
         self.generate_inner(input_ids, max_new_tokens, params, Some(tesla))
     }
 
-    /// Multi-request continuous batching path.
-    ///
-    /// Each entry is `(prompt_ids, max_new_tokens)`. Shared sampling + optional Tesla.
-    /// Returns map of request index → full token sequence (prompt + generated).
     pub fn generate_batch(
         self,
         requests: &[(Vec<u32>, usize)],
@@ -247,8 +226,8 @@ impl InferenceEngine {
         let mut generated: Vec<u32> = Vec::new();
         let mut total_stats = TeslaStepStats::default();
 
-        let prefill = Tensor::new(input_ids, &self.device)?.unsqueeze(0)?;
-        let logits = squeeze_logits(&self.model.forward(&prefill, 0, Some(&mut caches))?)?;
+        let logits =
+            squeeze_logits(&self.model.forward_prefill_chunk(input_ids, 0, &mut caches)?)?;
         let mut next = sample_token(&logits, params, &generated, &mut rng)?;
         tokens.push(next);
         generated.push(next);
@@ -334,9 +313,17 @@ impl InferenceEngine {
                 }
             } else {
                 let start_pos = caches.current_len();
-                let input = Tensor::new(&[next], &self.device)?.unsqueeze(0)?;
-                let logits =
-                    squeeze_logits(&self.model.forward(&input, start_pos, Some(&mut caches))?)?;
+                let logits = squeeze_logits(&self.model.forward_decode_batch(
+                    &[next],
+                    &[start_pos],
+                    &mut [&mut caches],
+                )?)?;
+                // decode batch returns [1, V]
+                let logits = match logits.dims() {
+                    [1, _] => logits.squeeze(0)?,
+                    [_] => logits,
+                    _ => squeeze_logits(&logits)?,
+                };
                 next = sample_token(&logits, params, &generated, &mut rng)?;
                 tokens.push(next);
                 generated.push(next);
