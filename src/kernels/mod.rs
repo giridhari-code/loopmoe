@@ -23,9 +23,10 @@ pub use cuda::{
     tiled_gemm_nn, tiled_gemm_nt, quantize_to_fp8_e4m3, dequant_fp8_e4m3, gemm_nn_fp8_weight,
 };
 
-// ── New kernel placeholders (paged attention path) ──────────────────────────
+// ── New kernel placeholders (paged-attention path)
+// Named distinctly to avoid clashing with existing cuda::silu_mul / rmsnorm re-exports.
 pub mod paged_attention;
-pub mod rmsnorm;
-pub mod rope;
-pub mod silu_mul;
+pub mod rmsnorm_paged;   // was rmsnorm.rs – avoid name clash with cuda::rmsnorm
+pub mod rope_paged;     // was rope.rs
+pub mod silu_mul_fused; // was silu_mul.rs
 pub mod gemm_fp8;
