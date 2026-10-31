@@ -1,8 +1,8 @@
-//! BatchEngine — continuous scheduler + Orbit Pulse (O2) step loop.
+//! BatchEngine — Orbit O3: chunked prefill + Tesla-in-schedule + Pulse B>1
 
 use std::collections::HashMap;
 
-use candle_core::DType;
+use candle_core::{DType, Tensor};
 use rand::{rngs::StdRng, SeedableRng};
 
 use crate::cache::{LayerCaches, MlaCaches, RuntimeCaches};
@@ -10,9 +10,9 @@ use crate::engine::inference::InferenceEngine;
 use crate::orbit::{
     pack::{PackItem, PackRole, PackedBatch},
     pulse::Pulse,
-    BlockLedger, LedgerConfig, CacheKind,
+    BlockLedger, CacheKind, LedgerConfig,
 };
-use crate::sampler::{is_stop, SamplingParams};
+use crate::sampler::{is_stop, sample_token, SamplingParams};
 use crate::scheduler::{
     ContinuousScheduler, SchedulerConfig, Sequence, SequenceStatus,
 };
@@ -30,6 +30,7 @@ struct SeqRuntime {
 pub struct BatchMetrics {
     pub steps: u64,
     pub prefills: u64,
+    pub prefill_chunks: u64,
     pub decodes: u64,
     pub tesla_steps: u64,
     pub tokens_generated: u64,
@@ -182,51 +183,30 @@ impl BatchEngine {
             for &id in outputs.finished.iter().chain(outputs.preempted.iter()) {
                 led.free_seq(id);
             }
-            for &id in outputs.decode_ids.iter().chain(outputs.prefill_ids.iter()) {
-                if let Some(s) = self.scheduler.get(id) {
-                    let need = if outputs.prefill_ids.contains(&id) {
-                        s.prompt_len.max(1)
-                    } else {
-                        s.len() + s.draft_len.unwrap_or(1)
-                    };
-                    let _ = led.ensure_tokens(id, need);
-                }
-            }
         }
 
-        let use_tesla = self.tesla.as_ref().map(|t| t.enabled).unwrap_or(false);
-
-        let mut prefill_items = Vec::new();
-        let mut decode_items = Vec::new();
-        for &id in &outputs.prefill_ids {
-            if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
+        // ── Chunked prefills ──────────────────────────────────────────────
+        for chunk in &outputs.prefill_chunks {
+            if self
+                .scheduler
+                .get(chunk.seq_id)
+                .map(|s| s.is_finished())
+                .unwrap_or(true)
+            {
                 continue;
             }
-            if let Some(seq) = self.scheduler.get(id) {
-                prefill_items.push(PackItem {
-                    seq_id: id,
-                    role: PackRole::Prefill,
-                    token_ids: seq.tokens[..seq.prompt_len].to_vec(),
-                    position: 0,
-                });
-            }
+            self.run_prefill_chunk(chunk.seq_id, chunk.start, chunk.len)?;
+            self.metrics.prefill_chunks += 1;
+            self.metrics.prefills += 1;
         }
+
+        // ── Plain decode via Pulse (B>1) ──────────────────────────────────
+        let mut decode_items = Vec::new();
         for &id in &outputs.decode_ids {
             if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
                 continue;
             }
             if self.scheduler.get(id).map(|s| s.is_prompt()).unwrap_or(false) {
-                if let Some(seq) = self.scheduler.get(id) {
-                    prefill_items.push(PackItem {
-                        seq_id: id,
-                        role: PackRole::Prefill,
-                        token_ids: seq.tokens[..seq.prompt_len].to_vec(),
-                        position: 0,
-                    });
-                }
-                continue;
-            }
-            if use_tesla {
                 continue;
             }
             if let Some(seq) = self.scheduler.get(id) {
@@ -245,125 +225,31 @@ impl BatchEngine {
             }
         }
 
-        let slots = if let Some(led) = self.ledger.as_ref() {
-            let mut ranges = Vec::new();
-            for it in prefill_items.iter().chain(decode_items.iter()) {
-                ranges.push((it.seq_id, it.position, it.token_ids.len()));
-            }
-            led.build_slot_mapping(&ranges)
-        } else {
-            Default::default()
-        };
-
-        let pack = PackedBatch {
-            num_prefill: prefill_items.len(),
-            num_decode: decode_items.len(),
-            num_tokens: prefill_items
-                .iter()
-                .chain(decode_items.iter())
-                .map(|i| i.token_ids.len())
-                .sum(),
-            items: {
-                let mut v = prefill_items;
-                v.extend(decode_items);
-                v
-            },
-            slots,
-        };
-
-        if !pack.is_empty() {
-            let mut caches_map = HashMap::new();
-            let mut gen_map = HashMap::new();
-            let mut rng_map = HashMap::new();
-            let mut mtp_map = HashMap::new();
-            let mut samp_map = HashMap::new();
-
-            for item in &pack.items {
-                if let Some(rt) = self.runtimes.remove(&item.seq_id) {
-                    gen_map.insert(item.seq_id, rt.generated);
-                    rng_map.insert(item.seq_id, rt.rng);
-                    caches_map.insert(item.seq_id, rt.caches);
-                    mtp_map.insert(item.seq_id, rt.mtp);
-                }
-                if let Some(seq) = self.scheduler.get(item.seq_id) {
-                    samp_map.insert(item.seq_id, seq.sampling.clone());
-                }
-            }
-
-            let pulse = Pulse::new(&self.engine.model, &self.engine.device);
-            let pout = pulse.run(&pack, &mut caches_map, &mut gen_map, &mut rng_map, &samp_map)?;
-            self.metrics.pulse_decode_forwards += pout.metrics.decode_forwards;
-            self.metrics.pulse_prefill_forwards += pout.metrics.prefill_forwards;
-
-            for (id, new_toks) in &pout.new_tokens {
-                for &t in new_toks {
-                    self.metrics.tokens_generated += 1;
-                    if let Some(seq) = self.scheduler.get_mut(*id) {
-                        let is_prefill = pack
-                            .items
-                            .iter()
-                            .any(|i| i.seq_id == *id && i.role == PackRole::Prefill);
-                        if is_prefill {
-                            seq.append_token(t);
-                            seq.mark_computed(seq.prompt_len);
-                            self.metrics.prefills += 1;
-                        } else {
-                            seq.append_token(t);
-                            seq.mark_computed(1);
-                            self.metrics.decodes += 1;
-                        }
-                        let max_tokens = seq.stop.max_tokens;
-                        let sampling = seq.sampling.clone();
-                        if is_stop(t, &sampling) || seq.generated_len() >= max_tokens {
-                            let status = if seq.generated_len() >= max_tokens {
-                                SequenceStatus::FinishedLengthCapped
-                            } else {
-                                SequenceStatus::FinishedStopped
-                            };
-                            seq.finish(status);
-                        }
-                    }
-                    if let Some(led) = self.ledger.as_mut() {
-                        let _ = led.append_token_slot(*id);
-                    }
-                }
-            }
-
-            // Restore all extracted runtimes (preserve MTP)
-            let ids: Vec<u64> = caches_map.keys().copied().collect();
-            for id in ids {
-                let caches = caches_map.remove(&id).unwrap();
-                let generated = gen_map.remove(&id).unwrap_or_default();
-                let rng = rng_map
-                    .remove(&id)
-                    .unwrap_or_else(|| StdRng::seed_from_u64(id));
-                let mtp = mtp_map.remove(&id).unwrap_or_default();
-                self.runtimes.insert(
-                    id,
-                    SeqRuntime {
-                        caches,
-                        mtp,
-                        generated,
-                        rng,
-                    },
-                );
-            }
+        if !decode_items.is_empty() {
+            let pack = PackedBatch {
+                num_prefill: 0,
+                num_decode: decode_items.len(),
+                num_tokens: decode_items.len(),
+                items: decode_items,
+                slots: Default::default(),
+            };
+            self.run_pulse_decode(&pack)?;
         }
 
-        if use_tesla {
-            for &id in &outputs.decode_ids {
-                if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
-                    continue;
-                }
-                if self.scheduler.get(id).map(|s| s.is_prompt()).unwrap_or(false) {
-                    continue;
-                }
-                self.run_decode_tesla(id)?;
-                self.metrics.tesla_steps += 1;
-                self.metrics.decodes += 1;
+        // ── Tesla lane (from schedule) ────────────────────────────────────
+        for &id in &outputs.tesla_ids {
+            if self.scheduler.get(id).map(|s| s.is_finished()).unwrap_or(true) {
+                continue;
             }
+            if self.scheduler.get(id).map(|s| s.is_prompt()).unwrap_or(false) {
+                continue;
+            }
+            self.run_decode_tesla(id)?;
+            self.metrics.tesla_steps += 1;
+            self.metrics.decodes += 1;
         }
 
+        // Finish reap
         let newly_done: Vec<u64> = self
             .scheduler
             .running_ids()
@@ -406,11 +292,10 @@ impl BatchEngine {
         }
         tracing::info!(
             steps = self.metrics.steps,
-            prefills = self.metrics.prefills,
+            prefill_chunks = self.metrics.prefill_chunks,
             decodes = self.metrics.decodes,
-            pulse_dec = self.metrics.pulse_decode_forwards,
-            pulse_pref = self.metrics.pulse_prefill_forwards,
             tesla = self.metrics.tesla_steps,
+            pulse_dec = self.metrics.pulse_decode_forwards,
             finished = self.metrics.finished,
             tokens = self.metrics.tokens_generated,
             "BatchEngine done"
@@ -427,6 +312,137 @@ impl BatchEngine {
 
     pub fn mtp_stats(&self, id: u64) -> Option<&MtpState> {
         self.runtimes.get(&id).map(|r| &r.mtp)
+    }
+
+    /// Chunked prefill: fill KV for [start, start+len). Sample only on last chunk.
+    fn run_prefill_chunk(&mut self, id: u64, start: usize, len: usize) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let (chunk_tokens, prompt_len, sampling, max_tokens) = {
+            let seq = self
+                .scheduler
+                .get(id)
+                .ok_or_else(|| anyhow::anyhow!("missing seq {id}"))?;
+            let end = (start + len).min(seq.prompt_len).min(seq.tokens.len());
+            if start >= end {
+                return Ok(());
+            }
+            (
+                seq.tokens[start..end].to_vec(),
+                seq.prompt_len,
+                seq.sampling.clone(),
+                seq.stop.max_tokens,
+            )
+        };
+        let actual_len = chunk_tokens.len();
+        let is_last = start + actual_len >= prompt_len;
+
+        let rt = self
+            .runtimes
+            .get_mut(&id)
+            .ok_or_else(|| anyhow::anyhow!("missing runtime {id}"))?;
+        let device = &self.engine.device;
+        let input = Tensor::new(chunk_tokens.as_slice(), device)?.unsqueeze(0)?;
+        let logits = squeeze_logits(&self.engine.model.forward(
+            &input,
+            start,
+            Some(&mut rt.caches),
+        )?)?;
+
+        if let Some(seq) = self.scheduler.get_mut(id) {
+            seq.mark_computed(actual_len);
+        }
+        if let Some(led) = self.ledger.as_mut() {
+            let _ = led.ensure_tokens(id, start + actual_len);
+        }
+
+        if is_last {
+            let next = sample_token(&logits, &sampling, &rt.generated, &mut rt.rng)?;
+            rt.generated.push(next);
+            self.metrics.tokens_generated += 1;
+            if let Some(led) = self.ledger.as_mut() {
+                let _ = led.append_token_slot(id);
+            }
+            if let Some(seq) = self.scheduler.get_mut(id) {
+                seq.append_token(next);
+                if is_stop(next, &sampling) || seq.generated_len() >= max_tokens {
+                    seq.finish(if seq.generated_len() >= max_tokens {
+                        SequenceStatus::FinishedLengthCapped
+                    } else {
+                        SequenceStatus::FinishedStopped
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn run_pulse_decode(&mut self, pack: &PackedBatch) -> Result<()> {
+        let mut caches_map = HashMap::new();
+        let mut gen_map = HashMap::new();
+        let mut rng_map = HashMap::new();
+        let mut mtp_map = HashMap::new();
+        let mut samp_map = HashMap::new();
+
+        for item in &pack.items {
+            if let Some(rt) = self.runtimes.remove(&item.seq_id) {
+                gen_map.insert(item.seq_id, rt.generated);
+                rng_map.insert(item.seq_id, rt.rng);
+                caches_map.insert(item.seq_id, rt.caches);
+                mtp_map.insert(item.seq_id, rt.mtp);
+            }
+            if let Some(seq) = self.scheduler.get(item.seq_id) {
+                samp_map.insert(item.seq_id, seq.sampling.clone());
+            }
+        }
+
+        let pulse = Pulse::new(&self.engine.model, &self.engine.device);
+        let pout = pulse.run(pack, &mut caches_map, &mut gen_map, &mut rng_map, &samp_map)?;
+        self.metrics.pulse_decode_forwards += pout.metrics.decode_forwards;
+
+        for (id, new_toks) in &pout.new_tokens {
+            for &t in new_toks {
+                self.metrics.tokens_generated += 1;
+                self.metrics.decodes += 1;
+                if let Some(seq) = self.scheduler.get_mut(*id) {
+                    seq.append_token(t);
+                    seq.mark_computed(1);
+                    let max_tokens = seq.stop.max_tokens;
+                    let sampling = seq.sampling.clone();
+                    if is_stop(t, &sampling) || seq.generated_len() >= max_tokens {
+                        seq.finish(if seq.generated_len() >= max_tokens {
+                            SequenceStatus::FinishedLengthCapped
+                        } else {
+                            SequenceStatus::FinishedStopped
+                        });
+                    }
+                }
+                if let Some(led) = self.ledger.as_mut() {
+                    let _ = led.append_token_slot(*id);
+                }
+            }
+        }
+
+        let ids: Vec<u64> = caches_map.keys().copied().collect();
+        for id in ids {
+            let caches = caches_map.remove(&id).unwrap();
+            let generated = gen_map.remove(&id).unwrap_or_default();
+            let rng = rng_map
+                .remove(&id)
+                .unwrap_or_else(|| StdRng::seed_from_u64(id));
+            let mtp = mtp_map.remove(&id).unwrap_or_default();
+            self.runtimes.insert(
+                id,
+                SeqRuntime {
+                    caches,
+                    mtp,
+                    generated,
+                    rng,
+                },
+            );
+        }
+        Ok(())
     }
 
     fn run_decode_tesla(&mut self, id: u64) -> Result<()> {
@@ -509,5 +525,16 @@ impl BatchEngine {
             }
         }
         Ok(())
+    }
+}
+
+fn squeeze_logits(logits: &Tensor) -> candle_core::Result<Tensor> {
+    use candle_core::IndexOp;
+    match logits.dims() {
+        [_] => Ok(logits.clone()),
+        [1, _] => logits.squeeze(0),
+        [1, 1, _] => logits.squeeze(0)?.squeeze(0),
+        dims if dims.len() == 2 => logits.i(0),
+        _ => logits.flatten_all(),
     }
 }
