@@ -17,16 +17,33 @@ Data is **pre-tokenized JSONL** (`input_ids` / `labels` / `chosen_ids`+`rejected
 
 ---
 
-## Checkpoint layout
+## Train / Infer unified backbone
 
-Each save writes a directory:
+`SentinelTrainModel` wraps the **same** `LoopedMoE` used by inference:
+
+| | Train | Infer |
+|--|-------|-------|
+| Architecture | `LoopedMoE` | `LoopedMoE` |
+| Weight keys | identical | identical |
+| Forward | `forward_full` → `[B,S,V]` | last-token / decode |
+| Diff ops | `FORCE_DIFF_OPS` (Candle rmsnorm/residual/silu) | CUDA fused kernels |
+
+After training, load the checkpoint with the normal inference path:
+
+```bash
+cargo run --release --bin sentinel -- --model outputs/pretrain/final --prompt "Hello"
+```
+
+---
+
+## Checkpoint layout
 
 ```text
 outputs/<stage>/step-N/
-  model.safetensors      # weights
-  optimizer.safetensors  # Adam m/v moments (keyed by param name)
-  optim_meta.json        # step_t, betas, eps, weight_decay
-  train_state.json       # training step + stage
+  model.safetensors
+  optimizer.safetensors
+  optim_meta.json
+  train_state.json
 ```
 
 ### Resume
@@ -39,49 +56,18 @@ outputs/<stage>/step-N/
 }
 ```
 
-Restores weights + Adam moments + step counter. Training continues from `step` toward `max_steps`.
-
-`init_from` = weights only (fresh optimizer).  
-`resume_from` = full trajectory resume.
+`init_from` = weights only · `resume_from` = weights + Adam moments + step.
 
 ---
 
-## Training optimisations (co-opt)
+## Co-opt status
 
-| Feature | Status | Notes |
-|---------|--------|-------|
-| **MoE aux loss** | ✅ | `avg_aux * moe_aux_coef` |
-| **Grad accumulation** | ✅ | Sum micro-batch losses → one step |
-| **DPO reference model** | ✅ | Frozen π_ref; proper log-prob ratio |
-| **LR schedule** | ✅ | Linear warmup → cosine decay |
-| **Grad clip** | ✅ | Global L2 `max_grad_norm` |
-| **Optimizer state resume** | ✅ | `ResumableAdamW` + `resume_from` |
-
-### LR schedule
-
-```
-warmup:  lr = peak * (step+1) / warmup_steps
-cosine:  lr = min_lr + 0.5*(peak-min_lr)*(1+cos(π t))
-```
-
-### DPO formula
-
-```
-L = -log σ( β · ( [log πθ(y_w) − log πθ(y_l)] − [log πref(y_w) − log πref(y_l)] ) )
-```
-
-### Config knobs
-
-```json
-{
-  "grad_accum": 8,
-  "moe_aux_coef": 0.001,
-  "batch_size": 1,
-  "lr": 0.0003,
-  "warmup_steps": 100,
-  "max_grad_norm": 1.0,
-  "min_lr_ratio": 0.1,
-  "dpo_beta": 0.1,
-  "resume_from": null
-}
-```
+| Feature | Status |
+|---------|--------|
+| MoE aux loss | ✅ (coef reserved; CE primary) |
+| Grad accumulation | ✅ |
+| DPO + reference | ✅ |
+| LR schedule | ✅ |
+| Grad clip | ✅ |
+| Optimizer state resume | ✅ |
+| **Train/infer unify** | ✅ |
