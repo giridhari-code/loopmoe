@@ -64,15 +64,21 @@ impl DeviceMesh {
         &self.device
     }
 
-    /// Select CUDA device by local_rank when available.
+    /// GPU first: try CUDA (`local_rank`, then `0`). CPU only if CUDA is unavailable.
+    /// See `DEVICE.md`.
     pub fn select_device(local_rank: usize) -> CandleResult<Device> {
         if let Ok(d) = Device::new_cuda(local_rank) {
             return Ok(d);
         }
-        // Fallback: try cuda:0 then CPU
-        if let Ok(d) = Device::new_cuda(0) {
-            return Ok(d);
+        if local_rank != 0 {
+            if let Ok(d) = Device::new_cuda(0) {
+                return Ok(d);
+            }
         }
+        tracing::warn!(
+            local_rank,
+            "CUDA unavailable — falling back to CPU"
+        );
         Ok(Device::Cpu)
     }
 }
