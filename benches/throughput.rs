@@ -1,3 +1,7 @@
-//! Throughput benchmark (tokens/sec)
+//! Throughput benchmark placeholder (tokens/sec).
+//!
+//! Wire Criterion later. This file must compile as a binary bench.
 
-// TODO: criterion or custom harness
+fn main() {
+    eprintln!("throughput bench not implemented yet — see README / ORBIT.md");
+}
