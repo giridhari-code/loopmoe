@@ -25,9 +25,19 @@ Checkpoints: `outputs/<stage>/final/model.safetensors`
 |---------|--------|-------|
 | **MoE aux loss** | ✅ | Load-balance term `avg_aux * moe_aux_coef` added to CE |
 | **Grad accumulation** | ✅ | `grad_accum` in config (default 1). Loss scaled by `1/accum` |
-| DPO reference model | ❌ | Still policy-only approximate |
+| **DPO reference model** | ✅ | Frozen π_ref from SFT; proper log-prob ratio loss |
 | Grad clip / LR schedule | ❌ | Planned |
 | Optimizer state resume | ❌ | Weights only |
+
+### DPO formula
+
+```
+L = -log σ( β · ( [log πθ(y_w) − log πθ(y_l)] − [log πref(y_w) − log πref(y_l)] ) )
+```
+
+- `πθ` = policy (trainable, init from SFT)
+- `πref` = reference (frozen copy of SFT)
+- `β` = `dpo_beta` (default 0.1)
 
 ### Config knobs
 
@@ -36,7 +46,8 @@ Checkpoints: `outputs/<stage>/final/model.safetensors`
   "grad_accum": 8,
   "moe_aux_coef": 0.001,
   "batch_size": 1,
-  "lr": 0.0003
+  "lr": 0.0003,
+  "dpo_beta": 0.1
 }
 ```
 
