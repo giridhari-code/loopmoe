@@ -70,6 +70,10 @@ path = "examples/simple_completion.rs"
 name = "chat_stream"
 path = "examples/chat_stream.rs"
 
+[[bench]]
+name = "throughput"
+harness = false
+
 [profile.release]
 opt-level = 3
 lto = "thin"
