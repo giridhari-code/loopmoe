@@ -3,6 +3,7 @@ use candle_nn::VarBuilder;
 use crate::config::ModelConfig;
 use crate::cache::{KvCache, MlaCache, RuntimeCaches};
 use crate::kernels::cuda::{residual_add, rmsnorm as fused_rmsnorm};
+use crate::kernels::force_diff_ops;
 use super::{Attention, MoeLayer, MlaAttention, rope::RotaryEmbedding};
 
 pub struct RmsNorm {
@@ -20,6 +21,10 @@ impl RmsNorm {
     }
 
     pub fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
+        // Training: pure Candle path (CUDA fused ops are no_bwd).
+        if force_diff_ops() {
+            return candle_nn::ops::rms_norm(x, &self.weight, self.eps);
+        }
         fused_rmsnorm(x, &self.weight, self.eps)
     }
 }
@@ -75,6 +80,14 @@ impl TransformerBlock {
         })
     }
 
+    fn add_residual(x: &Tensor, residual: &Tensor) -> CandleResult<Tensor> {
+        if force_diff_ops() {
+            Ok((x + residual)?)
+        } else {
+            residual_add(x, residual)
+        }
+    }
+
     pub fn forward(
         &self,
         x: &Tensor,
@@ -88,15 +101,14 @@ impl TransformerBlock {
         let x = self
             .self_attn
             .forward(&x, start_pos, gqa, mla, update_cache)?;
-        let x = residual_add(&x, residual)?;
+        let x = Self::add_residual(&x, residual)?;
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
         let x = self.mlp.forward(&x)?;
-        residual_add(&x, residual)
+        Self::add_residual(&x, residual)
     }
 
     /// Decode step for B sequences: batched norm/MLP, per-row attention+cache.
-    /// `x`: [B, 1, H], `positions.len()==B`, `caches.len()==B`.
     pub fn forward_decode_batch(
         &self,
         x: &Tensor,
@@ -112,7 +124,6 @@ impl TransformerBlock {
         let residual = x;
         let x_n = self.input_layernorm.forward(x)?;
 
-        // Attention: each row has its own position + cache
         let mut attn_rows = Vec::with_capacity(b);
         for i in 0..b {
             let row = x_n.narrow(0, i, 1)?;
@@ -135,12 +146,11 @@ impl TransformerBlock {
             attn_rows.push(out);
         }
         let x = Tensor::cat(&attn_rows, 0)?;
-        let x = residual_add(&x, residual)?;
+        let x = Self::add_residual(&x, residual)?;
 
         let residual = &x;
         let x = self.post_attention_layernorm.forward(&x)?;
-        // MoE already flattens B*S — true batched expert GEMMs
         let x = self.mlp.forward(&x)?;
-        residual_add(&x, residual)
+        Self::add_residual(&x, residual)
     }
 }
