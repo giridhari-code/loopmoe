@@ -1,37 +1,54 @@
 use anyhow::{bail, Result};
 use candle_core::{Device, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+use candle_nn::optim::ParamsAdamW;
 use rand::seq::SliceRandom;
 use std::path::Path;
 use tracing::info;
 
-use super::checkpoint::{dtype_for_train, load_varmap, save_varmap};
+use super::checkpoint::{dtype_for_train, load_varmap, save_checkpoint};
 use super::config::TrainConfig;
 use super::data::{collate_lm, load_lm_jsonl};
 use super::model::SentinelTrainModel;
-use super::optim::{backward_step_clipped, LrSchedule};
+use super::optim::{load_train_state, LrSchedule, ResumableAdamW};
 
 pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
-    let Some(init) = &cfg.init_from else {
-        bail!("midtrain requires init_from");
-    };
     let mut model = SentinelTrainModel::new(&cfg.model, device, dtype_for_train())?;
     model.aux_coef = cfg.moe_aux_coef;
-    load_varmap(&mut model.varmap, Path::new(init), device)?;
+
+    let mut start_step = 0usize;
+    if let Some(resume) = &cfg.resume_from {
+        load_varmap(&mut model.varmap, Path::new(resume), device)?;
+        if let Some(st) = load_train_state(Path::new(resume))? {
+            start_step = st.step;
+            info!(resume = %resume, start_step, "resuming midtrain");
+        }
+    } else {
+        let Some(init) = &cfg.init_from else {
+            bail!("midtrain requires init_from or resume_from");
+        };
+        load_varmap(&mut model.varmap, Path::new(init), device)?;
+    }
+
     let data = load_lm_jsonl(Path::new(&cfg.data_path), cfg.max_seq_len)?;
-    let vars = model.parameters()?;
-    let mut opt = AdamW::new(
-        vars.clone(),
+    let mut opt = ResumableAdamW::from_varmap(
+        &model.varmap,
         ParamsAdamW {
             lr: cfg.lr,
             weight_decay: cfg.weight_decay,
             ..Default::default()
         },
     )?;
+    if let Some(resume) = &cfg.resume_from {
+        if Path::new(resume).join("optimizer.safetensors").exists() {
+            opt.load(Path::new(resume), device)?;
+            info!(optim_step_t = opt.step_t, "restored optimizer state");
+        }
+    }
+
     let sched = LrSchedule::new(cfg.lr, cfg.warmup_steps, cfg.max_steps)
         .with_min_ratio(cfg.min_lr_ratio);
     let accum = cfg.grad_accum.max(1);
-    let mut step = 0usize;
+    let mut step = start_step;
     let mut rng = rand::thread_rng();
     let mut order: Vec<usize> = (0..data.len()).collect();
     let mut cursor = 0usize;
@@ -66,19 +83,28 @@ pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
         let loss_s = loss.to_scalar::<f32>()? as f64;
         let lr = sched.lr_at(step);
         opt.set_learning_rate(lr);
-        let gnorm = backward_step_clipped(&mut opt, &loss, &vars, cfg.max_grad_norm)?;
+        let gnorm = opt.backward_step_clipped(&loss, cfg.max_grad_norm)?;
         step += 1;
         if step % cfg.log_every == 0 {
             info!(step, loss = loss_s, lr, gnorm, "midtrain");
         }
         if step % cfg.save_every == 0 {
-            save_varmap(
-                &model.varmap,
+            save_checkpoint(
                 &Path::new(&cfg.output_dir).join(format!("step-{step}")),
+                &model.varmap,
+                &opt,
+                step,
+                "midtrain",
             )?;
         }
     }
-    save_varmap(&model.varmap, &Path::new(&cfg.output_dir).join("final"))?;
-    info!("midtrain done");
+    save_checkpoint(
+        &Path::new(&cfg.output_dir).join("final"),
+        &model.varmap,
+        &opt,
+        step,
+        "midtrain",
+    )?;
+    info!(step, "midtrain done");
     Ok(())
 }
