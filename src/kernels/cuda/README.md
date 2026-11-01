@@ -1,22 +1,23 @@
-# Sentinel custom CUDA kernels
+# Sentinel custom CUDA (device code)
 
-## Ops
+**Language: CUDA C++ only** for `__global__` kernels. Rust wraps them — see repo root **KERNELS.md**.
 
-| Kernel | f32 | f16 | bf16 |
-|--------|-----|-----|------|
-| silu_mul | yes | yes | yes |
-| scale | yes | yes | yes |
-| scatter_add_rows | yes | yes | yes |
-| **tiled GEMM NN** (16×16) | yes | yes | yes |
-| tiled GEMM NT | yes | — | — |
+## Built by `build.rs`
 
-## Tiled GEMM
+| File | Role |
+|------|------|
+| `sentinel.cu` | silu_mul, scale, scatter, residual, rmsnorm, tiled GEMM |
+| `fp8_kernels.cu` | FP8 quant / dequant / weight GEMM helpers |
+| `fp8.cuh` | shared headers |
 
-- Shared-memory **16×16** tiles, **float accumulate**
-- DoBu `dobu_gemm_*` + grouped expert GEMM call `tiled_gemm_nn` first
-- Auto-fallback to Candle/cuBLAS if PTX missing or size outside window
+## Rust wrappers
+
+`ops.rs`, `gemm.rs`, `fp8.rs` — Candle `Tensor` API + fallback if PTX missing.
+
+## Arch
 
 ```bash
-export CUDA_COMPUTE_CAP=89
-cargo build --release
+export CUDA_COMPUTE_CAP=75   # T4
+# export CUDA_COMPUTE_CAP=80 # A100
+cargo build --release --features cuda
 ```
