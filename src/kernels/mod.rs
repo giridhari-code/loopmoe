@@ -4,6 +4,7 @@ pub mod fertile;
 pub mod dobu;
 pub mod cuda;
 pub mod cpu;
+pub mod diff_ops;
 
 pub use fertile::{
     fertile_moe, select_backend, BackendInfo, BackendKind, DeviceGroupPlan, FertileDispatch,
@@ -21,6 +22,8 @@ pub use cuda::{
     residual_add, rmsnorm, tiled_gemm_nn, tiled_gemm_nt, quantize_to_fp8_e4m3, dequant_fp8_e4m3,
     gemm_nn_fp8_weight,
 };
+
+pub use diff_ops::{force_diff_ops, set_force_diff_ops, DiffOpsGuard};
 
 // New paged-attention placeholders (names avoid clash with cuda re-exports)
 pub mod paged_attention;
