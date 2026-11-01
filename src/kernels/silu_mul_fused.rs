@@ -1,5 +1,3 @@
-//! SiLU * mul fused kernel (new path)
+//! Re-export path: fused silu_mul is `cuda::silu_mul` (sentinel.cu).
 
-pub fn silu_mul_fused() {
-    // TODO
-}
+pub use crate::kernels::cuda::silu_mul;
