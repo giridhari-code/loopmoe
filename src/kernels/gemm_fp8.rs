@@ -1,5 +1,3 @@
-//! FP8 GEMM binding
+//! FP8 GEMM — see `cuda::gemm_nn_fp8_weight` / `fp8_kernels.cu`.
 
-pub fn gemm_fp8() {
-    // TODO
-}
+pub use crate::kernels::cuda::gemm_nn_fp8_weight;
