@@ -4,9 +4,11 @@
   "output_dir": "outputs/pretrain",
   "max_steps": 1000,
   "batch_size": 1,
+  "grad_accum": 8,
   "max_seq_len": 512,
   "lr": 0.0003,
   "weight_decay": 0.1,
+  "moe_aux_coef": 0.001,
   "log_every": 10,
   "save_every": 200
 }
