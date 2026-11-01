@@ -15,7 +15,34 @@ cargo run --release --bin sentinel-train -- --stage dpo --config configs/train_d
 
 Data is **pre-tokenized JSONL** (`input_ids` / `labels` / `chosen_ids`+`rejected_ids`).
 
-Checkpoints: `outputs/<stage>/final/model.safetensors`
+---
+
+## Checkpoint layout
+
+Each save writes a directory:
+
+```text
+outputs/<stage>/step-N/
+  model.safetensors      # weights
+  optimizer.safetensors  # Adam m/v moments (keyed by param name)
+  optim_meta.json        # step_t, betas, eps, weight_decay
+  train_state.json       # training step + stage
+```
+
+### Resume
+
+```json
+{
+  "stage": "pretrain",
+  "resume_from": "outputs/pretrain/step-500",
+  "max_steps": 1000
+}
+```
+
+Restores weights + Adam moments + step counter. Training continues from `step` toward `max_steps`.
+
+`init_from` = weights only (fresh optimizer).  
+`resume_from` = full trajectory resume.
 
 ---
 
@@ -23,12 +50,12 @@ Checkpoints: `outputs/<stage>/final/model.safetensors`
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **MoE aux loss** | ✅ | `avg_aux * moe_aux_coef` added to CE |
+| **MoE aux loss** | ✅ | `avg_aux * moe_aux_coef` |
 | **Grad accumulation** | ✅ | Sum micro-batch losses → one step |
-| **DPO reference model** | ✅ | Frozen π_ref from SFT; proper log-prob ratio |
+| **DPO reference model** | ✅ | Frozen π_ref; proper log-prob ratio |
 | **LR schedule** | ✅ | Linear warmup → cosine decay |
-| **Grad clip** | ✅ | Global L2 norm clip via `max_grad_norm` |
-| Optimizer state resume | ❌ | Weights only |
+| **Grad clip** | ✅ | Global L2 `max_grad_norm` |
+| **Optimizer state resume** | ✅ | `ResumableAdamW` + `resume_from` |
 
 ### LR schedule
 
@@ -36,17 +63,6 @@ Checkpoints: `outputs/<stage>/final/model.safetensors`
 warmup:  lr = peak * (step+1) / warmup_steps
 cosine:  lr = min_lr + 0.5*(peak-min_lr)*(1+cos(π t))
 ```
-
-- `warmup_steps` (default 100)
-- `min_lr_ratio` (default 0.1 → floor = 10% of peak)
-
-### Grad clip
-
-```
-max_grad_norm: 1.0   # 0 disables
-```
-
-Logs include `lr` and `gnorm` each `log_every` steps.
 
 ### DPO formula
 
@@ -65,8 +81,7 @@ L = -log σ( β · ( [log πθ(y_w) − log πθ(y_l)] − [log πref(y_w) − l
   "warmup_steps": 100,
   "max_grad_norm": 1.0,
   "min_lr_ratio": 0.1,
-  "dpo_beta": 0.1
+  "dpo_beta": 0.1,
+  "resume_from": null
 }
 ```
-
-Effective batch size ≈ `batch_size * grad_accum`.
