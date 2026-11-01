@@ -156,22 +156,33 @@ impl SentinelTrainModel {
 
     pub fn forward(&mut self, input_ids: &Tensor, labels: Option<&Tensor>) -> CResult<(Tensor, Option<Tensor>)> {
         let mut x = self.embed.forward(input_ids)?;
-        let mut aux = 0.0;
+        let mut aux = 0.0f64;
+        let mut n_aux = 0usize;
         for _ in 0..self.cfg.loop_count {
             for layer in self.layers.iter_mut() {
                 x = layer.forward(&x)?;
                 aux += layer.moe.last_aux;
+                n_aux += 1;
             }
         }
+        let avg_aux = if n_aux > 0 { aux / n_aux as f64 } else { 0.0 };
         let logits = self.lm_head.forward(&self.norm.forward(&x)?)?;
         let loss = if let Some(labels) = labels {
             let logits_s = logits.i((.., 0..logits.dim(1)? - 1, ..))?;
             let labels_s = labels.i((.., 1..labels.dim(1)?))?;
             let (b, t, v) = logits_s.dims3()?;
             let ce = masked_ce(&logits_s.reshape((b * t, v))?, &labels_s.reshape((b * t,))?)?;
-            let _ = aux;
-            Some(ce)
-        } else { None };
+            // MoE load-balance aux loss (Switch / DeepSeek style)
+            let total = if self.aux_coef > 0.0 && avg_aux > 0.0 {
+                let aux_t = Tensor::new(avg_aux as f32, ce.device())?.to_dtype(ce.dtype())?;
+                (ce + (aux_t * self.aux_coef)?)?
+            } else {
+                ce
+            };
+            Some(total)
+        } else {
+            None
+        };
         Ok((logits, loss))
     }
 
