@@ -66,6 +66,7 @@ impl LoopedMoE {
         })
     }
 
+    /// Inference forward: returns **last-position** logits `[B, V]` or `[V]`.
     pub fn forward(
         &self,
         input_ids: &Tensor,
@@ -104,8 +105,21 @@ impl LoopedMoE {
         self.lm_head.forward(&hidden)
     }
 
-    /// O3 helper: run a prompt slice `[start_pos, start_pos + tokens)` into cache.
-    /// Returns last-position logits (sample only when this is the final chunk).
+    /// **Training / full logits**: no KV cache, all positions → `[B, S, V]`.
+    /// Same weights and loop structure as inference.
+    pub fn forward_full(&self, input_ids: &Tensor) -> CandleResult<Tensor> {
+        let mut hidden = self.embed_tokens.forward(input_ids)?;
+        let num_loops = self.config.loop_count;
+        for _loop_idx in 0..num_loops {
+            for layer in self.layers.iter() {
+                // no cache; start_pos=0 for full sequence training
+                hidden = layer.forward(&hidden, 0, None, None, false)?;
+            }
+        }
+        let hidden = self.norm.forward(&hidden)?;
+        self.lm_head.forward(&hidden)
+    }
+
     pub fn forward_prefill_chunk(
         &self,
         tokens: &[u32],
@@ -119,7 +133,6 @@ impl LoopedMoE {
         self.forward(&input, start_pos, Some(caches))
     }
 
-    /// O2.1: one decode step for `B` sequences → logits `[B, vocab]`.
     pub fn forward_decode_batch(
         &self,
         tokens: &[u32],
