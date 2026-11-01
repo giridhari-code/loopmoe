@@ -7,6 +7,13 @@ Runtime architecture: **Orbit** (continuous batching + physical page ledger).
 
 ---
 
+## Device policy
+
+**GPU first.** CPU runs **only** when CUDA is unavailable (clear warning logged).  
+Details: **[DEVICE.md](DEVICE.md)** — tests and train/infer must not invert this.
+
+---
+
 ## Features
 
 | Area | Capability |
