@@ -3,6 +3,7 @@ use candle_nn::{linear_no_bias, Linear, Module, VarBuilder};
 use crate::config::ModelConfig;
 use crate::kernels::fertile::{fertile_moe, FertileExpert, FertileMoeParams, KERNEL_NAME};
 use crate::kernels::cuda::silu_mul;
+use crate::kernels::force_diff_ops;
 
 pub struct Expert {
     w1: Linear,
@@ -25,8 +26,13 @@ impl FertileExpert for Expert {
     fn forward(&self, x: &Tensor) -> CandleResult<Tensor> {
         let gate = self.w1.forward(x)?;
         let up = self.w3.forward(x)?;
-        // Fused silu(gate)*up — custom CUDA kernel when PTX built + f32
-        let hidden = silu_mul(&gate, &up)?;
+        let hidden = if force_diff_ops() {
+            // Pure Candle — has backward (CUDA silu_mul is no_bwd).
+            let s = candle_nn::ops::silu(&gate)?;
+            (s * up)?
+        } else {
+            silu_mul(&gate, &up)?
+        };
         self.w2.forward(&hidden)
     }
 }
