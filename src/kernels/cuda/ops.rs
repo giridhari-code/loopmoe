@@ -1,4 +1,4 @@
-//! Sentinel CUDA ops — f32 / f16 / bf16 silu_mul, scale, scatter_add_rows.
+//! Sentinel CUDA ops — silu_mul, scale, residual_add, rmsnorm, scatter.
 
 use candle_core::{
     CpuStorage, CustomOp1, CustomOp2, DType, Layout, Result as CResult, Shape, Tensor,
@@ -34,11 +34,29 @@ fn scale_kernel_name(dtype: DType) -> Option<&'static str> {
     }
 }
 
+fn residual_kernel_name(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::F32 => Some("sentinel_residual_add_f32"),
+        DType::F16 => Some("sentinel_residual_add_f16"),
+        DType::BF16 => Some("sentinel_residual_add_bf16"),
+        _ => None,
+    }
+}
+
 fn scatter_kernel_name(dtype: DType) -> Option<&'static str> {
     match dtype {
         DType::F32 => Some("sentinel_scatter_add_rows_f32"),
         DType::F16 => Some("sentinel_scatter_add_rows_f16"),
         DType::BF16 => Some("sentinel_scatter_add_rows_bf16"),
+        _ => None,
+    }
+}
+
+fn rmsnorm_kernel_name(dtype: DType) -> Option<&'static str> {
+    match dtype {
+        DType::F32 => Some("sentinel_rmsnorm_f32"),
+        DType::F16 => Some("sentinel_rmsnorm_f16"),
+        DType::BF16 => Some("sentinel_rmsnorm_bf16"),
         _ => None,
     }
 }
@@ -62,14 +80,13 @@ impl CustomOp2 for SiluMulOp {
         s2: &CpuStorage,
         l2: &Layout,
     ) -> CResult<(CpuStorage, Shape)> {
-        // Prefer f32 CPU path; other dtypes fall back via caller.
         let g = match s1 {
             CpuStorage::F32(v) => v,
-            _ => candle_core::bail!("silu_mul cpu: use Candle fallback for non-f32"),
+            _ => candle_core::bail!("silu_mul cpu: f32 only"),
         };
         let u = match s2 {
             CpuStorage::F32(v) => v,
-            _ => candle_core::bail!("silu_mul cpu: use Candle fallback for non-f32"),
+            _ => candle_core::bail!("silu_mul cpu: f32 only"),
         };
         let n = l1.shape().elem_count();
         let start1 = l1.start_offset();
@@ -107,11 +124,11 @@ impl CustomOp2 for SiluMulOp {
         let dev = s1.device();
         let n = l1.shape().elem_count();
         if n == 0 || n > u32::MAX as usize {
-            candle_core::bail!("silu_mul: element count exceeds CUDA kernel limit");
+            candle_core::bail!("silu_mul: bad element count");
         }
         let block = 256u32;
         let n_u32 = n as u32;
-        let grid = n_u32 / block + u32::from(n_u32 % block != 0);
+        let grid = n_u32.div_ceil(block);
         let cfg = LaunchConfig {
             grid_dim: (grid, 1, 1),
             block_dim: (block, 1, 1),
@@ -172,13 +189,159 @@ impl CustomOp2 for SiluMulOp {
 }
 
 pub fn silu_mul(gate: &Tensor, up: &Tensor) -> CResult<Tensor> {
-    if kernels_available(gate) && gate.dtype() == up.dtype() && gate.shape() == up.shape() {
-        if let Ok(t) = gate.apply_op2_no_bwd(up, &SiluMulOp) {
+    if gate.shape() != up.shape() {
+        candle_core::bail!("silu_mul: shape mismatch");
+    }
+    if gate.dtype() != up.dtype() {
+        candle_core::bail!("silu_mul: dtype mismatch");
+    }
+    let gate_c = gate.contiguous()?;
+    let up_c = up.contiguous()?;
+    if kernels_available(&gate_c) {
+        if let Ok(t) = gate_c.apply_op2_no_bwd(&up_c, &SiluMulOp) {
             return Ok(t);
         }
     }
-    let s = candle_nn::ops::silu(gate)?;
-    Ok((s * up)?)
+    let s = candle_nn::ops::silu(&gate_c)?;
+    Ok((s * up_c)?)
+}
+
+// ---------------------------------------------------------------------------
+// residual_add: a + b  (fused elementwise)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+struct ResidualAddOp;
+
+impl CustomOp2 for ResidualAddOp {
+    fn name(&self) -> &'static str {
+        "sentinel_residual_add"
+    }
+
+    fn cpu_fwd(
+        &self,
+        s1: &CpuStorage,
+        l1: &Layout,
+        s2: &CpuStorage,
+        l2: &Layout,
+    ) -> CResult<(CpuStorage, Shape)> {
+        let a = match s1 {
+            CpuStorage::F32(v) => v,
+            _ => candle_core::bail!("residual cpu: f32"),
+        };
+        let b = match s2 {
+            CpuStorage::F32(v) => v,
+            _ => candle_core::bail!("residual cpu: f32"),
+        };
+        let n = l1.shape().elem_count();
+        let mut out = vec![0f32; n];
+        let s1o = l1.start_offset();
+        let s2o = l2.start_offset();
+        for i in 0..n {
+            out[i] = a[s1o + i] + b[s2o + i];
+        }
+        Ok((CpuStorage::F32(out), l1.shape().clone()))
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(
+        &self,
+        s1: &candle_core::CudaStorage,
+        l1: &Layout,
+        s2: &candle_core::CudaStorage,
+        l2: &Layout,
+    ) -> CResult<(candle_core::CudaStorage, Shape)> {
+        use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+        use candle_core::cuda_backend::WrapErr;
+
+        if !ptx_ready() {
+            candle_core::bail!("no ptx");
+        }
+        if !l1.is_contiguous() || !l2.is_contiguous() {
+            candle_core::bail!("residual requires contiguous");
+        }
+        let dtype = s1.dtype();
+        let kname = residual_kernel_name(dtype)
+            .ok_or_else(|| candle_core::Error::Msg("residual dtype".into()))?;
+        let dev = s1.device();
+        let n = l1.shape().elem_count();
+        if n == 0 || n > u32::MAX as usize {
+            candle_core::bail!("residual: bad n");
+        }
+        let block = 256u32;
+        let n_u = n as u32;
+        let cfg = LaunchConfig {
+            grid_dim: (n_u.div_ceil(block), 1, 1),
+            block_dim: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let func = dev.get_or_load_custom_func(kname, "sentinel_kernels", SENTINEL_PTX)?;
+
+        match dtype {
+            DType::F32 => {
+                let a = s1.as_cuda_slice::<f32>()?.slice(l1.start_offset()..);
+                let b = s2.as_cuda_slice::<f32>()?.slice(l2.start_offset()..);
+                let dst = unsafe { dev.alloc::<f32>(n) }.w()?;
+                let mut builder = func.builder();
+                builder.arg(&dst);
+                builder.arg(&a);
+                builder.arg(&b);
+                builder.arg(&n_u);
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok((
+                    candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
+                    l1.shape().clone(),
+                ))
+            }
+            DType::F16 => {
+                let a = s1.as_cuda_slice::<half::f16>()?.slice(l1.start_offset()..);
+                let b = s2.as_cuda_slice::<half::f16>()?.slice(l2.start_offset()..);
+                let dst = unsafe { dev.alloc::<half::f16>(n) }.w()?;
+                let mut builder = func.builder();
+                builder.arg(&dst);
+                builder.arg(&a);
+                builder.arg(&b);
+                builder.arg(&n_u);
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok((
+                    candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
+                    l1.shape().clone(),
+                ))
+            }
+            DType::BF16 => {
+                let a = s1.as_cuda_slice::<half::bf16>()?.slice(l1.start_offset()..);
+                let b = s2.as_cuda_slice::<half::bf16>()?.slice(l2.start_offset()..);
+                let dst = unsafe { dev.alloc::<half::bf16>(n) }.w()?;
+                let mut builder = func.builder();
+                builder.arg(&dst);
+                builder.arg(&a);
+                builder.arg(&b);
+                builder.arg(&n_u);
+                unsafe { builder.launch(cfg) }.w()?;
+                Ok((
+                    candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
+                    l1.shape().clone(),
+                ))
+            }
+            _ => candle_core::bail!("residual dtype"),
+        }
+    }
+}
+
+/// Fused residual: `a + b` (elementwise).
+pub fn residual_add(a: &Tensor, b: &Tensor) -> CResult<Tensor> {
+    if a.shape() != b.shape() {
+        // broadcast path — Candle
+        return a.broadcast_add(b);
+    }
+    let a_c = a.contiguous()?;
+    let b_c = b.contiguous()?;
+    if kernels_available(&a_c) && a_c.dtype() == b_c.dtype() {
+        if let Ok(t) = a_c.apply_op2_no_bwd(&b_c, &ResidualAddOp) {
+            return Ok(t);
+        }
+    }
+    Ok((a_c + b_c)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -225,24 +388,21 @@ impl CustomOp1 for ScaleOp {
             candle_core::bail!("scale requires contiguous");
         }
         let dtype = storage.dtype();
-        let kname = scale_kernel_name(dtype).ok_or_else(|| {
-            candle_core::Error::Msg(format!("scale: unsupported {dtype:?}"))
-        })?;
+        let kname = scale_kernel_name(dtype)
+            .ok_or_else(|| candle_core::Error::Msg(format!("scale: unsupported {dtype:?}")))?;
         let dev = storage.device();
         let n = layout.shape().elem_count();
         if n == 0 || n > u32::MAX as usize {
-            candle_core::bail!("scale: element count exceeds CUDA kernel limit");
+            candle_core::bail!("scale: bad n");
         }
         let block = 256u32;
-        let n_u32 = n as u32;
-        let grid = n_u32 / block + u32::from(n_u32 % block != 0);
+        let n_u = n as u32;
         let cfg = LaunchConfig {
-            grid_dim: (grid, 1, 1),
+            grid_dim: (n_u.div_ceil(block), 1, 1),
             block_dim: (block, 1, 1),
             shared_mem_bytes: 0,
         };
         let func = dev.get_or_load_custom_func(kname, "sentinel_kernels", SENTINEL_PTX)?;
-        let n_u = n as u32;
 
         match dtype {
             DType::F32 => {
@@ -293,41 +453,204 @@ impl CustomOp1 for ScaleOp {
 }
 
 pub fn scale_mul(x: &Tensor, scale: f32) -> CResult<Tensor> {
-    if kernels_available(x) {
-        if let Ok(t) = x.apply_op1_no_bwd(&ScaleOp { scale }) {
+    let x_c = x.contiguous()?;
+    if kernels_available(&x_c) {
+        if let Ok(t) = x_c.apply_op1_no_bwd(&ScaleOp { scale }) {
             return Ok(t);
         }
     }
-    Ok((x * f64::from(scale))?)
+    Ok((x_c * f64::from(scale))?)
 }
 
 // ---------------------------------------------------------------------------
-// scatter_add_rows — CustomOp2(base, values) + indices carried in struct
+// RMSNorm (row-wise over last dim) — fused reduction + scale
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct ScatterAddOp {
-    /// Device tensor of int32 indices, length = values.dim(0).
-    /// Stored as raw pointer is unsafe across devices; we re-resolve from Tensor id
-    /// by requiring caller to pass contiguous int32 via a side channel.
-    /// Instead: indices are the first input through a different design —
-    /// we pack nothing here and use a three-tensor path via storage launch helper.
-    n: u32,
-    h: u32,
+pub fn rmsnorm(x: &Tensor, weight: &Tensor, eps: f64) -> CResult<Tensor> {
+    #[cfg(feature = "cuda")]
+    {
+        if let Ok(t) = rmsnorm_cuda(x, weight, eps) {
+            return Ok(t);
+        }
+    }
+    candle_nn::ops::rms_norm(x, weight, eps)
 }
 
-/// Scatter-add using custom CUDA kernel when possible.
-/// `indices`: 1-D int/uint token ids (length n), `values`: (n, h), `base`: (t, h).
+#[cfg(feature = "cuda")]
+fn rmsnorm_cuda(x: &Tensor, weight: &Tensor, eps: f64) -> CResult<Tensor> {
+    use candle_core::cuda_backend::cudarc::driver::{LaunchConfig, PushKernelArg};
+    use candle_core::cuda_backend::WrapErr;
+    use candle_core::backend::BackendDevice;
+
+    if !ptx_ready() || !x.device().is_cuda() {
+        candle_core::bail!("no cuda rmsnorm");
+    }
+    let dtype = x.dtype();
+    let kname = rmsnorm_kernel_name(dtype)
+        .ok_or_else(|| candle_core::Error::Msg("rmsnorm dtype".into()))?;
+
+    // Flatten to (rows, dim) where dim = last axis
+    let dims = x.dims();
+    if dims.is_empty() {
+        candle_core::bail!("rmsnorm empty");
+    }
+    let dim = *dims.last().unwrap();
+    let rows = x.elem_count() / dim;
+    if dim == 0 || rows == 0 {
+        candle_core::bail!("rmsnorm zero");
+    }
+
+    let x_c = x.contiguous()?;
+    let w_f32 = weight.to_dtype(DType::F32)?.contiguous()?;
+    if w_f32.elem_count() != dim {
+        candle_core::bail!("rmsnorm weight size mismatch");
+    }
+
+    let dev = match x_c.device() {
+        candle_core::Device::Cuda(d) => d.clone(),
+        _ => candle_core::bail!("not cuda"),
+    };
+
+    // Launch via a tiny CustomOp1 on x that captures weight tensor
+    struct RmsOp {
+        weight: Tensor,
+        eps: f32,
+        rows: u32,
+        dim: u32,
+    }
+    impl CustomOp1 for RmsOp {
+        fn name(&self) -> &'static str {
+            "sentinel_rmsnorm"
+        }
+        fn cpu_fwd(
+            &self,
+            _: &CpuStorage,
+            _: &Layout,
+        ) -> CResult<(CpuStorage, Shape)> {
+            candle_core::bail!("cuda only")
+        }
+        fn cuda_fwd(
+            &self,
+            storage: &candle_core::CudaStorage,
+            layout: &Layout,
+        ) -> CResult<(candle_core::CudaStorage, Shape)> {
+            if !ptx_ready() {
+                candle_core::bail!("no ptx");
+            }
+            let dtype = storage.dtype();
+            let kname = rmsnorm_kernel_name(dtype)
+                .ok_or_else(|| candle_core::Error::Msg("dtype".into()))?;
+            let dev = storage.device();
+            let func = dev.get_or_load_custom_func(kname, "sentinel_kernels", SENTINEL_PTX)?;
+
+            let (w_storage, w_layout) = match self.weight.storage_and_layout() {
+                (candle_core::Storage::Cuda(s), l) => (s, l),
+                _ => candle_core::bail!("weight must be cuda"),
+            };
+            let w_slice = w_storage
+                .as_cuda_slice::<f32>()?
+                .slice(w_layout.start_offset()..);
+
+            let block = 256u32.min(self.dim.max(1));
+            let cfg = LaunchConfig {
+                grid_dim: (self.rows, 1, 1),
+                block_dim: (block, 1, 1),
+                shared_mem_bytes: block * 4, // float reduction buffer
+            };
+            let n_elem = layout.shape().elem_count();
+
+            match dtype {
+                DType::F32 => {
+                    let x = storage.as_cuda_slice::<f32>()?.slice(layout.start_offset()..);
+                    let dst = unsafe { dev.alloc::<f32>(n_elem) }.w()?;
+                    let mut b = func.builder();
+                    b.arg(&dst);
+                    b.arg(&x);
+                    b.arg(&w_slice);
+                    b.arg(&self.eps);
+                    b.arg(&self.rows);
+                    b.arg(&self.dim);
+                    unsafe { b.launch(cfg) }.w()?;
+                    Ok((
+                        candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
+                        layout.shape().clone(),
+                    ))
+                }
+                DType::F16 => {
+                    let x = storage.as_cuda_slice::<half::f16>()?.slice(layout.start_offset()..);
+                    let dst = unsafe { dev.alloc::<half::f16>(n_elem) }.w()?;
+                    let mut b = func.builder();
+                    b.arg(&dst);
+                    b.arg(&x);
+                    b.arg(&w_slice);
+                    b.arg(&self.eps);
+                    b.arg(&self.rows);
+                    b.arg(&self.dim);
+                    unsafe { b.launch(cfg) }.w()?;
+                    Ok((
+                        candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
+                        layout.shape().clone(),
+                    ))
+                }
+                DType::BF16 => {
+                    let x = storage
+                        .as_cuda_slice::<half::bf16>()?
+                        .slice(layout.start_offset()..);
+                    let dst = unsafe { dev.alloc::<half::bf16>(n_elem) }.w()?;
+                    let mut b = func.builder();
+                    b.arg(&dst);
+                    b.arg(&x);
+                    b.arg(&w_slice);
+                    b.arg(&self.eps);
+                    b.arg(&self.rows);
+                    b.arg(&self.dim);
+                    unsafe { b.launch(cfg) }.w()?;
+                    Ok((
+                        candle_core::CudaStorage::wrap_cuda_slice(dst, dev.clone()),
+                        layout.shape().clone(),
+                    ))
+                }
+                _ => candle_core::bail!("rmsnorm dtype"),
+            }
+        }
+    }
+
+    let _ = (dev, kname); // used inside op
+    let op = RmsOp {
+        weight: w_f32,
+        eps: eps as f32,
+        rows: rows as u32,
+        dim: dim as u32,
+    };
+    x_c.apply_op1_no_bwd(&op)
+}
+
+// ---------------------------------------------------------------------------
+// scatter_add_rows
+// ---------------------------------------------------------------------------
+
 pub fn scatter_add_rows(base: &Tensor, indices: &Tensor, values: &Tensor) -> CResult<Tensor> {
+    let n = indices.dims1()?;
+    let (_t, h) = base.dims2()?;
+    let v_dims = values.dims();
+    if v_dims != [n, h] {
+        candle_core::bail!(
+            "scatter_add_rows: values shape {:?} must be (n={}, h={})",
+            v_dims,
+            n,
+            h
+        );
+    }
+    if n == 0 {
+        return Ok(base.clone());
+    }
+
     #[cfg(feature = "cuda")]
     {
         if let Ok(t) = scatter_add_rows_cuda(base, indices, values) {
             return Ok(t);
         }
     }
-    // Candle fallback (works all dtypes / devices)
-    let h = values.dim(1)?;
-    let n = indices.dims1()?;
     let idx = indices
         .to_dtype(DType::U32)?
         .unsqueeze(1)?
@@ -346,37 +669,20 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
         candle_core::bail!("no cuda kernels");
     }
     let dtype = base.dtype();
-    let kname = scatter_kernel_name(dtype).ok_or_else(|| {
-        candle_core::Error::Msg("scatter dtype".into())
-    })?;
+    let _ = scatter_kernel_name(dtype).ok_or_else(|| candle_core::Error::Msg("scatter dtype".into()))?;
     if values.dtype() != dtype {
         candle_core::bail!("dtype mismatch");
     }
 
     let (t, h) = base.dims2()?;
     let n = indices.dims1()?;
-    if values.dims() != [n, h] {
-        candle_core::bail!("values shape must be (n, h)");
+    if n > u32::MAX as usize || h > u32::MAX as usize || t > u32::MAX as usize {
+        candle_core::bail!("scatter dimensions exceed u32");
     }
 
-    // Clone base into mutable output (scatter-add accumulates into a copy)
     let out = base.contiguous()?;
     let idx_i32 = indices.to_dtype(DType::I32)?.contiguous()?;
     let vals = values.contiguous()?;
-
-    // Launch via a dummy CustomOp1 on `out` is awkward; use apply_op1 with closure data.
-    // Direct path: force cuda storage access through a tiny CustomOp1 that only needs out.
-    // We embed n,h and use thread-local... no.
-    //
-    // Practical approach: use Candle scatter for correctness if we cannot get three slices.
-    // Try launching through SiluMul-style by packing — for now call through
-    // `out.apply_op2_no_bwd(vals, &ScatterPair { ...})` won't get indices.
-    //
-    // Use Tensor::from + internal: fall back to candle scatter_add which IS a CUDA kernel
-    // in Candle, then additionally document our kernel for future CustomOp3.
-    //
-    // Attempt CustomOp2(out, vals) where indices live in Arc inside op — indices must be
-    // CudaStorage. We'll clone indices into the op as Tensor (reference counted).
 
     struct ScatterPair {
         idx: Tensor,
@@ -390,10 +696,10 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
         }
         fn cpu_fwd(
             &self,
-            _s1: &CpuStorage,
-            _l1: &Layout,
-            _s2: &CpuStorage,
-            _l2: &Layout,
+            _: &CpuStorage,
+            _: &Layout,
+            _: &CpuStorage,
+            _: &Layout,
         ) -> CResult<(CpuStorage, Shape)> {
             candle_core::bail!("scatter custom op is CUDA-only")
         }
@@ -404,17 +710,15 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
             s_val: &candle_core::CudaStorage,
             l_val: &Layout,
         ) -> CResult<(candle_core::CudaStorage, Shape)> {
-            if !ptx_ready() {
-                candle_core::bail!("no ptx");
+            if !ptx_ready() || self.n == 0 {
+                candle_core::bail!("no ptx or n=0");
             }
             let dtype = s_out.dtype();
-            let kname = scatter_kernel_name(dtype).ok_or_else(|| {
-                candle_core::Error::Msg("dtype".into())
-            })?;
+            let kname = scatter_kernel_name(dtype)
+                .ok_or_else(|| candle_core::Error::Msg("dtype".into()))?;
             let dev = s_out.device();
             let func = dev.get_or_load_custom_func(kname, "sentinel_kernels", SENTINEL_PTX)?;
 
-            // indices tensor storage
             let idx_storage = match self.idx.storage_and_layout() {
                 (candle_core::Storage::Cuda(s), layout) => (s, layout),
                 _ => candle_core::bail!("indices must be cuda"),
@@ -424,11 +728,10 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                 .as_cuda_slice::<i32>()?
                 .slice(idx_storage.1.start_offset()..);
 
-            // Work in-place conceptually: alloc dst = copy of out, atomic add values
             let n_elem = l_out.shape().elem_count();
             let cfg = LaunchConfig {
                 grid_dim: (self.n, 1, 1),
-                block_dim: (256, 1, 1),
+                block_dim: (256.min(self.h.max(1)), 1, 1),
                 shared_mem_bytes: 0,
             };
 
@@ -436,7 +739,6 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                 DType::F32 => {
                     let src = s_out.as_cuda_slice::<f32>()?.slice(l_out.start_offset()..);
                     let dst = unsafe { dev.alloc::<f32>(n_elem) }.w()?;
-                    // copy base → dst
                     dev.dtod_copy(&src.slice(0..n_elem), &dst).w()?;
                     let val = s_val.as_cuda_slice::<f32>()?.slice(l_val.start_offset()..);
                     let mut b = func.builder();
@@ -471,10 +773,14 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
                     ))
                 }
                 DType::BF16 => {
-                    let src = s_out.as_cuda_slice::<half::bf16>()?.slice(l_out.start_offset()..);
+                    let src = s_out
+                        .as_cuda_slice::<half::bf16>()?
+                        .slice(l_out.start_offset()..);
                     let dst = unsafe { dev.alloc::<half::bf16>(n_elem) }.w()?;
                     dev.dtod_copy(&src.slice(0..n_elem), &dst).w()?;
-                    let val = s_val.as_cuda_slice::<half::bf16>()?.slice(l_val.start_offset()..);
+                    let val = s_val
+                        .as_cuda_slice::<half::bf16>()?
+                        .slice(l_val.start_offset()..);
                     let mut b = func.builder();
                     b.arg(&val);
                     b.arg(&idx_slice);
@@ -500,10 +806,6 @@ fn scatter_add_rows_cuda(base: &Tensor, indices: &Tensor, values: &Tensor) -> CR
         out_rows: t as u32,
     };
     out.apply_op2_no_bwd(&vals, &op)
-}
-
-pub fn rmsnorm(x: &Tensor, weight: &Tensor, eps: f64) -> CResult<Tensor> {
-    candle_nn::ops::rms_norm(x, weight, eps)
 }
 
 pub fn bias_add(x: &Tensor, bias: &Tensor) -> CResult<Tensor> {

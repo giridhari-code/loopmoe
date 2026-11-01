@@ -1,14 +1,15 @@
-//! Custom CUDA kernels for Sentinel (Fertile / DoBu / FP8).
+//! Custom CUDA kernels for Sentinel (Fertile / DoBu / FP8 / fused norms).
 
 mod ops;
 mod gemm;
 mod fp8;
 
-pub use ops::{bias_add, rmsnorm, scale_mul, scatter_add_rows, silu_mul, kernels_available};
-pub use gemm::{tiled_gemm_nn, tiled_gemm_nt, should_use_tiled};
+pub use ops::{
+    bias_add, kernels_available, residual_add, rmsnorm, scale_mul, scatter_add_rows, silu_mul,
+};
+pub use gemm::{should_use_tiled, tiled_gemm_nn, tiled_gemm_nt};
 pub use fp8::{
-    dequant_fp8_e4m3, fp8_scale_from_amax, fp8_supported, gemm_nn_fp8_weight,
-    quantize_to_fp8_e4m3,
+    dequant_fp8_e4m3, fp8_scale_from_amax, fp8_supported, gemm_nn_fp8_weight, quantize_to_fp8_e4m3,
 };
 
 include!(concat!(env!("OUT_DIR"), "/sentinel_ptx.rs"));

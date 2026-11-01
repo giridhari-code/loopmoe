@@ -1,4 +1,4 @@
-// Sentinel custom CUDA kernels — f32 / f16 / bf16 + tiled GEMM.
+// Sentinel custom CUDA kernels — f32 / f16 / bf16 + tiled GEMM + fused norms.
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -61,6 +61,32 @@ extern "C" __global__ void sentinel_scale_bf16(
     unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
     out[i] = __float2bfloat16(__bfloat162float(x[i]) * scale);
+}
+
+// ===================== residual_add: out = a + b =====================
+
+extern "C" __global__ void sentinel_residual_add_f32(
+    float *out, const float *a, const float *b, unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = a[i] + b[i];
+}
+
+extern "C" __global__ void sentinel_residual_add_f16(
+    __half *out, const __half *a, const __half *b, unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2half(__half2float(a[i]) + __half2float(b[i]));
+}
+
+extern "C" __global__ void sentinel_residual_add_bf16(
+    __nv_bfloat16 *out, const __nv_bfloat16 *a, const __nv_bfloat16 *b, unsigned int n
+) {
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    out[i] = __float2bfloat16(__bfloat162float(a[i]) + __bfloat162float(b[i]));
 }
 
 // ===================== scatter_add_rows =====================
@@ -133,8 +159,7 @@ extern "C" __global__ void sentinel_scatter_add_rows_bf16(
     }
 }
 
-// ===================== tiled GEMM (NN): C[M,N] = A[M,K] @ B[K,N] =====================
-// TILE=16 shared-memory blocking, float accumulate for all dtypes.
+// ===================== tiled GEMM =====================
 
 #define SENTINEL_TILE 16
 
@@ -219,7 +244,6 @@ extern "C" __global__ void sentinel_gemm_nn_bf16(
     if (row < M && col < N) C[row * N + col] = __float2bfloat16(acc);
 }
 
-// NT: C = A @ B^T  → B is (N,K) stored row-major as B[n,k], we need B^T[k,n] = B[n,k]
 extern "C" __global__ void sentinel_gemm_nt_f32(
     float *C, const float *A, const float *B,
     int M, int N, int K
@@ -232,10 +256,9 @@ extern "C" __global__ void sentinel_gemm_nt_f32(
     int tiles = K / SENTINEL_TILE + (K % SENTINEL_TILE != 0);
     for (int t = 0; t < tiles; ++t) {
         int a_col = t * SENTINEL_TILE + threadIdx.x;
-        int b_col = t * SENTINEL_TILE + threadIdx.y; // B is (N,K): B[col, k]
+        int b_col = t * SENTINEL_TILE + threadIdx.y;
         As[threadIdx.y][threadIdx.x] =
             (row < M && a_col < K) ? A[row * K + a_col] : 0.f;
-        // load B^T tile: element (k, n) = B[n, k]
         Bs[threadIdx.y][threadIdx.x] =
             (col < N && b_col < K) ? B[col * K + b_col] : 0.f;
         __syncthreads();
@@ -247,6 +270,9 @@ extern "C" __global__ void sentinel_gemm_nt_f32(
     }
     if (row < M && col < N) C[row * N + col] = acc;
 }
+
+// ===================== RMSNorm (row-wise, last dim = dim) =====================
+// weight may be null → scale 1.0
 
 extern "C" __global__ void sentinel_rmsnorm_f32(
     float *out, const float *x, const float *weight,
@@ -270,5 +296,87 @@ extern "C" __global__ void sentinel_rmsnorm_f32(
     for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
         float w = weight ? weight[i] : 1.f;
         out[row * dim + i] = x[row * dim + i] * inv_rms * w;
+    }
+}
+
+extern "C" __global__ void sentinel_rmsnorm_f16(
+    __half *out, const __half *x, const float *weight,
+    float eps, unsigned int rows, unsigned int dim
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float shared[];
+    float local = 0.f;
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = __half2float(x[row * dim + i]);
+        local += v * v;
+    }
+    shared[threadIdx.x] = local;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) shared[threadIdx.x] += shared[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(shared[0] / (float)dim + eps);
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float w = weight ? weight[i] : 1.f;
+        float v = __half2float(x[row * dim + i]) * inv_rms * w;
+        out[row * dim + i] = __float2half(v);
+    }
+}
+
+extern "C" __global__ void sentinel_rmsnorm_bf16(
+    __nv_bfloat16 *out, const __nv_bfloat16 *x, const float *weight,
+    float eps, unsigned int rows, unsigned int dim
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float shared[];
+    float local = 0.f;
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = __bfloat162float(x[row * dim + i]);
+        local += v * v;
+    }
+    shared[threadIdx.x] = local;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) shared[threadIdx.x] += shared[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(shared[0] / (float)dim + eps);
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float w = weight ? weight[i] : 1.f;
+        float v = __bfloat162float(x[row * dim + i]) * inv_rms * w;
+        out[row * dim + i] = __float2bfloat16(v);
+    }
+}
+
+// ===================== fused: out = rmsnorm(a + b) =====================
+// Common variant used by some stacks; available for future layer rewrites.
+
+extern "C" __global__ void sentinel_add_rmsnorm_f32(
+    float *out, const float *a, const float *b, const float *weight,
+    float eps, unsigned int rows, unsigned int dim
+) {
+    unsigned int row = blockIdx.x;
+    if (row >= rows) return;
+    extern __shared__ float shared[];
+    float local = 0.f;
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = a[row * dim + i] + b[row * dim + i];
+        shared[dim + i] = v; // stash sum in high half if shared large enough — use register loop twice instead
+        local += v * v;
+    }
+    shared[threadIdx.x] = local;
+    __syncthreads();
+    for (unsigned int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) shared[threadIdx.x] += shared[threadIdx.x + s];
+        __syncthreads();
+    }
+    float inv_rms = rsqrtf(shared[0] / (float)dim + eps);
+    for (unsigned int i = threadIdx.x; i < dim; i += blockDim.x) {
+        float v = a[row * dim + i] + b[row * dim + i];
+        float w = weight ? weight[i] : 1.f;
+        out[row * dim + i] = v * inv_rms * w;
     }
 }

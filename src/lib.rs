@@ -1,12 +1,4 @@
-//! loopmoe / Sentinel v1.0 — high-performance inference runtime
-//!
-//! Professional modular layout:
-//! - `server`      OpenAI-compatible HTTP + SSE (requires `server` feature)
-//! - `scheduler`   continuous batching + paged KV
-//! - `engine`      InferenceEngine + future continuous-batch executor
-//! - `model`       Looped-MoE + future Llama/Qwen
-//! - `kernels`     Fertile / DoBu / CUDA + new paged-attention stubs
-//! - `utils`       tokenizer, logging
+//! loopmoe / Sentinel — Orbit O1–O5 inference runtime
 
 pub mod config;
 pub mod error;
@@ -14,13 +6,16 @@ pub mod error;
 #[cfg(feature = "server")]
 pub mod server;
 
+#[cfg(feature = "server")]
+pub mod frontier;
+
+pub mod orbit;
 pub mod scheduler;
 pub mod engine;
 pub mod model;
 pub mod kernels;
 pub mod utils;
 
-// Existing specialized modules
 pub mod cache;
 pub mod parallel;
 pub mod recipe;
@@ -30,8 +25,8 @@ pub mod sampler;
 pub mod tokenizer;
 
 pub use config::{ModelConfig, ServerConfig};
-pub use engine::InferenceEngine;
-pub use model::{LoopedMoE, SentinelV1};
+pub use engine::{BatchEngine, InferenceEngine};
+pub use model::{InferModel, LoopedMoE, SentinelV1, WeightLoader, WeightPaths, WeightSource};
 pub use cache::{
     KvCache, LayerCaches, MlaCache, MlaCaches, RuntimeCaches, kv_bytes_estimate, mla_bytes_estimate,
 };
@@ -42,10 +37,21 @@ pub use recipe::{
     ChatCompletionRequest, ChatCompletionResponse, Conversation, Message, RecipePipeline, Role,
     SentinelEncoding,
 };
-pub use tesla::TeslaConfig;
+pub use tesla::{MtpState, TeslaConfig};
 pub use parallel::{
     ParallelConfig, ParallelismKind, DeviceMesh, RankInfo, ExpertParallelPlan, ExpertShard,
-    AllToAllStub, DispatchMeta, CombineMeta,
+    AllToAllStub, DispatchMeta, CombineMeta, pack_by_ep_rank, unpack_combine, expert_to_rank,
 };
+pub use scheduler::{
+    ContinuousScheduler, PrefillChunk, SchedulerConfig, SchedulerOutputs, Sequence, SequenceStatus,
+};
+pub use orbit::{
+    hash_prompt_pages, hash_token_block, BlockLedger, CacheKind, LedgerConfig, LedgerStats,
+    OrbitCore, OrbitMetrics, OrbitSched, PackItem, PackResolve, PackRole, PackedBatch, PrefixStats,
+    Pulse, PulseMetrics, PulseOutput, SeqBlockTable, SlotMapping,
+};
+
+#[cfg(feature = "server")]
+pub use frontier::{frontier_router, load_frontier, serve, FrontierState};
 
 pub type Result<T> = anyhow::Result<T>;
