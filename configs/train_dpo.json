@@ -4,6 +4,10 @@
   "output_dir": "outputs/dpo",
   "init_from": "outputs/sft/final",
   "max_steps": 200,
+  "batch_size": 1,
+  "grad_accum": 4,
   "lr": 5e-7,
-  "dpo_beta": 0.1
+  "dpo_beta": 0.1,
+  "log_every": 10,
+  "save_every": 50
 }
