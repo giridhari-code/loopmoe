@@ -1,4 +1,8 @@
-//! Fertile (MoE) + DoBu (GEMM + MLA + FP8) + custom CUDA kernels
+//! Kernel layer — see **KERNELS.md**.
+//!
+//! - **Device math:** CUDA C++ (`cuda/sentinel.cu`, `fp8_kernels.cu`)
+//! - **Host dispatch:** Rust (`cuda/ops.rs`, `fertile/`, `dobu/`)
+//! - **Train:** `diff_ops` forces differentiable Candle paths
 
 pub mod fertile;
 pub mod dobu;
@@ -25,7 +29,7 @@ pub use cuda::{
 
 pub use diff_ops::{force_diff_ops, set_force_diff_ops, DiffOpsGuard};
 
-// New paged-attention placeholders (names avoid clash with cuda re-exports)
+// Optional / future paged paths (not required for train)
 pub mod paged_attention;
 pub mod rmsnorm_paged;
 pub mod rope_paged;
