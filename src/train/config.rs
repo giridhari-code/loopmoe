@@ -20,6 +20,10 @@ pub struct TrainConfig {
     pub output_dir: String,
     #[serde(default)]
     pub init_from: Option<String>,
+    /// Resume from a full checkpoint dir (weights + optim + step).
+    /// Takes precedence over init_from for weights; also restores Adam state.
+    #[serde(default)]
+    pub resume_from: Option<String>,
     #[serde(default = "default_steps")]
     pub max_steps: usize,
     #[serde(default = "default_bs")]
@@ -40,13 +44,10 @@ pub struct TrainConfig {
     pub dpo_beta: f64,
     #[serde(default = "default_aux")]
     pub moe_aux_coef: f64,
-    /// Linear warmup steps before cosine decay. 0 = no warmup.
     #[serde(default = "default_warmup")]
     pub warmup_steps: usize,
-    /// Global L2 grad-norm clip. 0 = disabled.
     #[serde(default = "default_clip")]
     pub max_grad_norm: f64,
-    /// Cosine floor as fraction of peak LR (default 0.1).
     #[serde(default = "default_min_lr_ratio")]
     pub min_lr_ratio: f64,
 }
@@ -78,6 +79,7 @@ impl TrainConfig {
             data_path: "data/pretrain.jsonl".into(),
             output_dir: "outputs/pretrain".into(),
             init_from: None,
+            resume_from: None,
             max_steps: 100_000,
             batch_size: 1,
             max_seq_len: 2048,
