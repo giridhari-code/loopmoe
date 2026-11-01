@@ -154,28 +154,31 @@ impl SentinelTrainModel {
         Ok(Self { varmap, embed, layers, norm, lm_head, cfg: cfg.clone(), aux_coef: 0.001 })
     }
 
+    /// Forward pass returning logits and optional CE(+aux) loss.
     pub fn forward(&mut self, input_ids: &Tensor, labels: Option<&Tensor>) -> CResult<(Tensor, Option<Tensor>)> {
-        let mut x = self.embed.forward(input_ids)?;
-        let mut aux = 0.0f64;
-        let mut n_aux = 0usize;
-        for _ in 0..self.cfg.loop_count {
-            for layer in self.layers.iter_mut() {
-                x = layer.forward(&x)?;
-                aux += layer.moe.last_aux;
-                n_aux += 1;
-            }
-        }
-        let avg_aux = if n_aux > 0 { aux / n_aux as f64 } else { 0.0 };
-        let logits = self.lm_head.forward(&self.norm.forward(&x)?)?;
+        let logits = self.forward_logits(input_ids)?;
         let loss = if let Some(labels) = labels {
             let logits_s = logits.i((.., 0..logits.dim(1)? - 1, ..))?;
             let labels_s = labels.i((.., 1..labels.dim(1)?))?;
             let (b, t, v) = logits_s.dims3()?;
             let ce = masked_ce(&logits_s.reshape((b * t, v))?, &labels_s.reshape((b * t,))?)?;
-            // MoE load-balance aux loss (Switch / DeepSeek style)
-            let total = if self.aux_coef > 0.0 && avg_aux > 0.0 {
-                let aux_t = Tensor::new(avg_aux as f32, ce.device())?.to_dtype(ce.dtype())?;
-                (ce + (aux_t * self.aux_coef)?)?
+            let total = if self.aux_coef > 0.0 {
+                // avg aux from last forward_logits call is not tracked here;
+                // aux is accumulated inside forward_logits via layers — recompute cheaply from last_aux
+                let mut aux = 0.0f64;
+                let mut n = 0usize;
+                for layer in &self.layers {
+                    aux += layer.moe.last_aux;
+                    n += 1;
+                }
+                // loop_count already applied inside forward_logits; last_aux is per last loop
+                let avg = if n > 0 { aux / n as f64 } else { 0.0 };
+                if avg > 0.0 {
+                    let aux_t = Tensor::new(avg as f32, ce.device())?.to_dtype(ce.dtype())?;
+                    (ce + (aux_t * self.aux_coef)?)?
+                } else {
+                    ce
+                }
             } else {
                 ce
             };
@@ -186,13 +189,47 @@ impl SentinelTrainModel {
         Ok((logits, loss))
     }
 
+    /// Shared backbone → logits [B, S, V].
+    fn forward_logits(&mut self, input_ids: &Tensor) -> CResult<Tensor> {
+        let mut x = self.embed.forward(input_ids)?;
+        for _ in 0..self.cfg.loop_count {
+            for layer in self.layers.iter_mut() {
+                x = layer.forward(&x)?;
+            }
+        }
+        self.lm_head.forward(&self.norm.forward(&x)?)
+    }
+
+    /// Sum of token log-probs for DPO: Σ log π(y_t | y_<t) over non-masked labels.
+    /// Returns scalar tensor (batch mean of sequence log-likelihoods).
+    pub fn sequence_logprob(&mut self, input_ids: &Tensor, labels: &Tensor) -> CResult<Tensor> {
+        let logits = self.forward_logits(input_ids)?;
+        let logits_s = logits.i((.., 0..logits.dim(1)? - 1, ..))?;
+        let labels_s = labels.i((.., 1..labels.dim(1)?))?;
+        let (b, t, v) = logits_s.dims3()?;
+        sum_logprob(&logits_s.reshape((b * t, v))?, &labels_s.reshape((b * t,))?, b)
+    }
+
     pub fn parameters(&self) -> Result<Vec<candle_core::Var>> {
         Ok(self.varmap.all_vars())
     }
 }
 
-/// Cross-entropy that ignores label -100.
+/// Cross-entropy that ignores label -100 (mean NLL).
 fn masked_ce(logits: &Tensor, labels: &Tensor) -> CResult<Tensor> {
+    let (lp, mask, cnt) = logprob_parts(logits, labels)?;
+    lp.neg()?.mul(&mask)?.sum_all()? / cnt
+}
+
+/// Mean sequence log-likelihood (sum of log p over tokens, averaged over batch).
+fn sum_logprob(logits: &Tensor, labels: &Tensor, batch: usize) -> CResult<Tensor> {
+    let (lp, mask, _cnt) = logprob_parts(logits, labels)?;
+    // sum over all tokens, then mean over batch
+    let total = lp.mul(&mask)?.sum_all()?;
+    total / (batch as f64).max(1.0)
+}
+
+fn logprob_parts(logits: &Tensor, labels: &Tensor) -> CResult<(Tensor, Tensor, f64)> {
     let dev = logits.device();
     let lab = labels.to_vec1::<i64>()?;
     let safe: Vec<u32> = lab.iter().map(|&l| if l < 0 { 0 } else { l as u32 }).collect();
@@ -203,5 +240,5 @@ fn masked_ce(logits: &Tensor, labels: &Tensor) -> CResult<Tensor> {
     let mask = Tensor::from_vec(mask, (n,), dev)?;
     let lp = candle_nn::ops::log_softmax(&logits.to_dtype(DType::F32)?, D::Minus1)?;
     let picked = lp.gather(&safe, 1)?.squeeze(1)?;
-    picked.neg()?.mul(&mask)?.sum_all()? / cnt
+    Ok((picked, mask, cnt))
 }
