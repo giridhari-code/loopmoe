@@ -12,4 +12,5 @@ pub mod dpo;
 
 pub use config::TrainConfig;
 pub use model::SentinelTrainModel;
-pub use optim::{LrSchedule, backward_step_clipped, clip_grad_norm};
+pub use optim::{LrSchedule, ResumableAdamW, clip_grad_norm};
+pub use checkpoint::save_checkpoint;
