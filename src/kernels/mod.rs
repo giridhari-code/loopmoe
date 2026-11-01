@@ -28,10 +28,3 @@ pub use cuda::{
 };
 
 pub use diff_ops::{force_diff_ops, set_force_diff_ops, DiffOpsGuard};
-
-// Optional / future paged paths (not required for train)
-pub mod paged_attention;
-pub mod rmsnorm_paged;
-pub mod rope_paged;
-pub mod silu_mul_fused;
-pub mod gemm_fp8;
