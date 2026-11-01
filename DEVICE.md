@@ -18,6 +18,30 @@ This is the opposite of “prefer CPU” or “force CPU for tests”. CPU is a 
 
 ---
 
+## CUDA toolkit versions
+
+| Toolkit | Support |
+|---------|---------|
+| 11.x / 12.x | Yes |
+| **13.0+** (Colab current) | Yes — requires **candle-core/nn ≥ 0.9.2** (cudarc ≥ 0.17 / 0.19) |
+
+`candle 0.8` + `cudarc 0.13` panics with:
+
+```text
+Unsupported cuda toolkit version: `13.0`
+```
+
+loopmoe is pinned to **candle 0.9.2** so Colab CUDA 13 builds work with the default `cuda` feature.
+
+Optional env (usually not needed with 0.9.2):
+
+```bash
+export CUDA_COMPUTE_CAP=7.5   # T4
+# export CUDA_HOME=/usr/local/cuda
+```
+
+---
+
 ## Implementation map
 
 | Location | Behaviour |
@@ -48,8 +72,12 @@ Strict “CUDA-only or fail” is allowed only for explicit `#[ignore]` / `cuda`
 ## Colab / operators
 
 1. Runtime type: **GPU** (T4 / A100).
-2. Build with default `cuda` feature when a GPU is available.
-3. `--no-default-features` (CPU-only build) only when there is no GPU or CUDA toolkit link fails.
+2. `git pull` then build with default `cuda` feature (candle 0.9.2).
+3. `--no-default-features` (CPU-only build) only when there is no GPU or link still fails.
+
+```bash
+cargo build --release --bin sentinel-train
+```
 
 ---
 
