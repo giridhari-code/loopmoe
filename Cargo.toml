@@ -7,8 +7,10 @@ license = "Apache-2.0"
 build = "build.rs"
 
 [dependencies]
-candle-core = { version = "0.8", default-features = false }
-candle-nn = { version = "0.8", default-features = false }
+# 0.9.2+ pulls cudarc >=0.17 with CUDA 13.x toolkit support (Colab / new drivers).
+# 0.8.x used cudarc 0.13 which panics on toolkit 13.0.
+candle-core = { version = "0.9.2", default-features = false }
+candle-nn = { version = "0.9.2", default-features = false }
 safetensors = "0.4"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
@@ -32,6 +34,7 @@ bytes = { version = "1", optional = true }
 
 [features]
 default = ["cuda"]
+# Requires NVIDIA toolkit; CUDA 12.x and 13.x supported via candle 0.9.2 / cudarc 0.19.
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 arm = []
 cpu = []
