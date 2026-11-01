@@ -2,13 +2,14 @@ use std::env;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Accept `75`, `7.5`, `80`, `8.0`, etc. → `-arch=sm_XX`.
 fn cuda_arch_flag() -> String {
-    // Colab T4 = 7.5, A100 = 8.0, etc. Override with CUDA_COMPUTE_CAP=7.5
-    let cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "7.5".into());
-    let arch = if cap.contains('.') {
-        format!("sm_{}", cap.replace('.', ""))
+    let cap = env::var("CUDA_COMPUTE_CAP").unwrap_or_else(|_| "75".into());
+    let digits: String = cap.chars().filter(|c| c.is_ascii_digit()).collect();
+    let arch = if digits.is_empty() {
+        "sm_75".into()
     } else {
-        format!("sm_{cap}")
+        format!("sm_{digits}")
     };
     format!("-arch={arch}")
 }
