@@ -23,21 +23,36 @@ Checkpoints: `outputs/<stage>/final/model.safetensors`
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| **MoE aux loss** | ✅ | Load-balance term `avg_aux * moe_aux_coef` added to CE |
-| **Grad accumulation** | ✅ | `grad_accum` in config (default 1). Loss scaled by `1/accum` |
-| **DPO reference model** | ✅ | Frozen π_ref from SFT; proper log-prob ratio loss |
-| Grad clip / LR schedule | ❌ | Planned |
+| **MoE aux loss** | ✅ | `avg_aux * moe_aux_coef` added to CE |
+| **Grad accumulation** | ✅ | Sum micro-batch losses → one step |
+| **DPO reference model** | ✅ | Frozen π_ref from SFT; proper log-prob ratio |
+| **LR schedule** | ✅ | Linear warmup → cosine decay |
+| **Grad clip** | ✅ | Global L2 norm clip via `max_grad_norm` |
 | Optimizer state resume | ❌ | Weights only |
+
+### LR schedule
+
+```
+warmup:  lr = peak * (step+1) / warmup_steps
+cosine:  lr = min_lr + 0.5*(peak-min_lr)*(1+cos(π t))
+```
+
+- `warmup_steps` (default 100)
+- `min_lr_ratio` (default 0.1 → floor = 10% of peak)
+
+### Grad clip
+
+```
+max_grad_norm: 1.0   # 0 disables
+```
+
+Logs include `lr` and `gnorm` each `log_every` steps.
 
 ### DPO formula
 
 ```
 L = -log σ( β · ( [log πθ(y_w) − log πθ(y_l)] − [log πref(y_w) − log πref(y_l)] ) )
 ```
-
-- `πθ` = policy (trainable, init from SFT)
-- `πref` = reference (frozen copy of SFT)
-- `β` = `dpo_beta` (default 0.1)
 
 ### Config knobs
 
@@ -47,6 +62,9 @@ L = -log σ( β · ( [log πθ(y_w) − log πθ(y_l)] − [log πref(y_w) − l
   "moe_aux_coef": 0.001,
   "batch_size": 1,
   "lr": 0.0003,
+  "warmup_steps": 100,
+  "max_grad_norm": 1.0,
+  "min_lr_ratio": 0.1,
   "dpo_beta": 0.1
 }
 ```
