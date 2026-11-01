@@ -40,6 +40,15 @@ pub struct TrainConfig {
     pub dpo_beta: f64,
     #[serde(default = "default_aux")]
     pub moe_aux_coef: f64,
+    /// Linear warmup steps before cosine decay. 0 = no warmup.
+    #[serde(default = "default_warmup")]
+    pub warmup_steps: usize,
+    /// Global L2 grad-norm clip. 0 = disabled.
+    #[serde(default = "default_clip")]
+    pub max_grad_norm: f64,
+    /// Cosine floor as fraction of peak LR (default 0.1).
+    #[serde(default = "default_min_lr_ratio")]
+    pub min_lr_ratio: f64,
 }
 
 fn default_out() -> String { "outputs/train".into() }
@@ -53,6 +62,9 @@ fn default_log() -> usize { 10 }
 fn default_save() -> usize { 1000 }
 fn default_beta() -> f64 { 0.1 }
 fn default_aux() -> f64 { 0.001 }
+fn default_warmup() -> usize { 100 }
+fn default_clip() -> f64 { 1.0 }
+fn default_min_lr_ratio() -> f64 { 0.1 }
 
 impl TrainConfig {
     pub fn from_json(path: &str) -> anyhow::Result<Self> {
@@ -76,6 +88,9 @@ impl TrainConfig {
             save_every: 1000,
             dpo_beta: 0.1,
             moe_aux_coef: 0.001,
+            warmup_steps: 1000,
+            max_grad_norm: 1.0,
+            min_lr_ratio: 0.1,
         }
     }
 }
