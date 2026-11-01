@@ -1,21 +1,19 @@
 //! Direct Preference Optimization (Rafailov et al.)
 //!
 //! L = -log σ( β * ( log πθ(y_w) - log πθ(y_l) - log πref(y_w) + log πref(y_l) ) )
-//!
-//! Policy πθ is trainable; reference πref is frozen (SFT checkpoint).
 
 use anyhow::{bail, Result};
 use candle_core::{Device, Tensor};
-use candle_nn::{AdamW, Optimizer, ParamsAdamW};
+use candle_nn::optim::ParamsAdamW;
 use rand::seq::SliceRandom;
 use std::path::Path;
 use tracing::info;
 
-use super::checkpoint::{dtype_for_train, load_varmap, save_varmap};
+use super::checkpoint::{dtype_for_train, load_varmap, save_checkpoint};
 use super::config::TrainConfig;
 use super::data::{collate_lm, load_dpo_jsonl, LmExample};
 use super::model::SentinelTrainModel;
-use super::optim::{backward_step_clipped, LrSchedule};
+use super::optim::{load_train_state, LrSchedule, ResumableAdamW};
 
 fn ids_as_lm(ids: Vec<u32>) -> LmExample {
     let labels: Vec<i64> = ids.iter().map(|&x| x as i64).collect();
@@ -34,40 +32,63 @@ fn softplus(x: &Tensor) -> candle_core::Result<Tensor> {
 }
 
 pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
-    let Some(init) = &cfg.init_from else {
-        bail!("dpo requires init_from (SFT checkpoint used as both policy init and reference)");
-    };
-
     let mut policy = SentinelTrainModel::new(&cfg.model, device, dtype_for_train())?;
     policy.aux_coef = 0.0;
-    load_varmap(&mut policy.varmap, Path::new(init), device)?;
+
+    let mut start_step = 0usize;
+    let ref_init: String;
+
+    if let Some(resume) = &cfg.resume_from {
+        load_varmap(&mut policy.varmap, Path::new(resume), device)?;
+        if let Some(st) = load_train_state(Path::new(resume))? {
+            start_step = st.step;
+            info!(resume = %resume, start_step, "resuming dpo");
+        }
+        // Reference stays the original SFT init when possible
+        ref_init = cfg
+            .init_from
+            .clone()
+            .unwrap_or_else(|| resume.clone());
+    } else {
+        let Some(init) = &cfg.init_from else {
+            bail!("dpo requires init_from or resume_from");
+        };
+        load_varmap(&mut policy.varmap, Path::new(init), device)?;
+        ref_init = init.clone();
+    }
 
     let mut reference = SentinelTrainModel::new(&cfg.model, device, dtype_for_train())?;
     reference.aux_coef = 0.0;
-    load_varmap(&mut reference.varmap, Path::new(init), device)?;
+    load_varmap(&mut reference.varmap, Path::new(&ref_init), device)?;
 
     let data = load_dpo_jsonl(Path::new(&cfg.data_path), cfg.max_seq_len)?;
-    let vars = policy.parameters()?;
-    let mut opt = AdamW::new(
-        vars.clone(),
+    let mut opt = ResumableAdamW::from_varmap(
+        &policy.varmap,
         ParamsAdamW {
             lr: cfg.lr,
             weight_decay: 0.0,
             ..Default::default()
         },
     )?;
+    if let Some(resume) = &cfg.resume_from {
+        if Path::new(resume).join("optimizer.safetensors").exists() {
+            opt.load(Path::new(resume), device)?;
+            info!(optim_step_t = opt.step_t, "restored optimizer state");
+        }
+    }
+
     let sched = LrSchedule::new(cfg.lr, cfg.warmup_steps, cfg.max_steps)
         .with_min_ratio(cfg.min_lr_ratio);
     let beta = cfg.dpo_beta;
     let accum = cfg.grad_accum.max(1);
-    let mut step = 0usize;
+    let mut step = start_step;
     let mut rng = rand::thread_rng();
     let mut order: Vec<usize> = (0..data.len()).collect();
     let mut cursor = 0usize;
 
     info!(
         beta,
-        ref_ckpt = %init,
+        ref_ckpt = %ref_init,
         n_pairs = data.len(),
         "DPO start (policy + frozen reference)"
     );
@@ -128,21 +149,30 @@ pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
         let loss_s = loss.to_scalar::<f32>()? as f64;
         let lr = sched.lr_at(step);
         opt.set_learning_rate(lr);
-        let gnorm = backward_step_clipped(&mut opt, &loss, &vars, cfg.max_grad_norm)?;
+        let gnorm = opt.backward_step_clipped(&loss, cfg.max_grad_norm)?;
 
         step += 1;
         if step % cfg.log_every == 0 {
             info!(step, loss = loss_s, lr, gnorm, margin = last_margin, "dpo");
         }
         if step % cfg.save_every == 0 {
-            save_varmap(
-                &policy.varmap,
+            save_checkpoint(
                 &Path::new(&cfg.output_dir).join(format!("step-{step}")),
+                &policy.varmap,
+                &opt,
+                step,
+                "dpo",
             )?;
         }
     }
 
-    save_varmap(&policy.varmap, &Path::new(&cfg.output_dir).join("final"))?;
-    info!("dpo done");
+    save_checkpoint(
+        &Path::new(&cfg.output_dir).join("final"),
+        &policy.varmap,
+        &opt,
+        step,
+        "dpo",
+    )?;
+    info!(step, "dpo done");
     Ok(())
 }
