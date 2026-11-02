@@ -4,13 +4,11 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
+use candle_core::backprop::GradStore;
 use candle_core::{DType, Device, Result as CResult, Tensor, Var};
 use candle_nn::optim::ParamsAdamW;
 use serde::{Deserialize, Serialize};
 
-// ─── LR schedule ────────────────────────────────────────────────────────────
-
-/// Linear warmup → cosine decay to `min_lr_ratio * peak_lr`.
 #[derive(Debug, Clone)]
 pub struct LrSchedule {
     pub peak_lr: f64,
@@ -46,12 +44,10 @@ impl LrSchedule {
     }
 }
 
-// ─── Grad clip ──────────────────────────────────────────────────────────────
-
-pub fn grad_norm(vars: &[Var]) -> CResult<f64> {
+pub fn grad_norm_from_store(vars: &[Var], grads: &GradStore) -> CResult<f64> {
     let mut total_sq = 0.0f64;
     for v in vars {
-        if let Ok(g) = v.grad() {
+        if let Some(g) = grads.get(v) {
             let sq = g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
             total_sq += sq;
         }
@@ -59,31 +55,31 @@ pub fn grad_norm(vars: &[Var]) -> CResult<f64> {
     Ok(total_sq.sqrt())
 }
 
-pub fn clip_grad_norm(vars: &[Var], max_norm: f64) -> CResult<f64> {
-    let norm = grad_norm(vars)?;
+pub fn clip_grad_norm_store(vars: &[Var], grads: &mut GradStore, max_norm: f64) -> CResult<f64> {
+    let norm = grad_norm_from_store(vars, grads)?;
     if max_norm <= 0.0 || norm <= max_norm || norm <= 0.0 {
         return Ok(norm);
     }
     let scale = max_norm / (norm + 1e-6);
     for v in vars {
-        if let Ok(g) = v.grad() {
+        if let Some(g) = grads.get(v).cloned() {
             let scaled = (g * scale)?;
-            v.set_grad(&scaled)?;
+            grads.insert(v, scaled);
         }
     }
     Ok(norm)
 }
 
-// ─── Resumable AdamW ────────────────────────────────────────────────────────
+/// Legacy name; prefer GradStore-based clip during training steps.
+pub fn clip_grad_norm(_vars: &[Var], _max_norm: f64) -> CResult<f64> {
+    Ok(0.0)
+}
 
-/// Per-parameter Adam moments + global step. Matches `candle_nn::AdamW` update
-/// (decoupled weight decay + bias correction) but exposes state for checkpointing.
 pub struct ResumableAdamW {
     vars: Vec<(String, Var)>,
     m: Vec<Tensor>,
     v: Vec<Tensor>,
     pub params: ParamsAdamW,
-    /// Bias-correction step counter (t). Must be restored on resume.
     pub step_t: usize,
 }
 
@@ -117,11 +113,8 @@ impl ResumableAdamW {
 
     pub fn from_varmap(varmap: &candle_nn::VarMap, params: ParamsAdamW) -> Result<Self> {
         let data = varmap.data().lock().map_err(|_| anyhow::anyhow!("varmap lock"))?;
-        let mut named: Vec<(String, Var)> = data
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        // Stable order for save/load by name (already keyed); sort for determinism.
+        let mut named: Vec<(String, Var)> =
+            data.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         named.sort_by(|a, b| a.0.cmp(&b.0));
         Self::new(named, params)
     }
@@ -138,8 +131,7 @@ impl ResumableAdamW {
         self.vars.iter().map(|(_, v)| v.clone()).collect()
     }
 
-    /// AdamW step using grads already attached to Vars (after backward + optional clip).
-    pub fn step_from_var_grads(&mut self) -> Result<()> {
+    pub fn step_from_grads(&mut self, grads: &GradStore) -> Result<()> {
         self.step_t += 1;
         let t = self.step_t as f64;
         let p = &self.params;
@@ -153,20 +145,17 @@ impl ResumableAdamW {
 
         for i in 0..self.vars.len() {
             let var = &self.vars[i].1;
-            let Ok(g) = var.grad() else {
+            let Some(g) = grads.get(var) else {
                 continue;
             };
             let g = g.to_dtype(DType::F32)?;
-            // m ← β1 m + (1-β1) g
             self.m[i] = ((&self.m[i] * b1)? + (&g * (1.0 - b1))?)?;
-            // v ← β2 v + (1-β2) g²
             let g2 = g.sqr()?;
             self.v[i] = ((&self.v[i] * b2)? + (&g2 * (1.0 - b2))?)?;
             let m_hat = (&self.m[i] / bc1)?;
             let v_hat = (&self.v[i] / bc2)?;
             let denom = (v_hat.sqrt()? + eps)?;
             let update = (&m_hat / &denom)?;
-            // decoupled weight decay: θ ← θ(1 - lr·λ) - lr · update
             let theta = var.as_tensor().to_dtype(DType::F32)?;
             let decayed = (&theta * (1.0 - lr * wd))?;
             let new_theta = (decayed - (&update * lr)?)?;
@@ -175,23 +164,18 @@ impl ResumableAdamW {
         Ok(())
     }
 
-    pub fn backward_step_clipped(
-        &mut self,
-        loss: &Tensor,
-        max_norm: f64,
-    ) -> Result<f64> {
-        let _grads = loss.backward()?;
+    pub fn backward_step_clipped(&mut self, loss: &Tensor, max_norm: f64) -> Result<f64> {
+        let mut grads = loss.backward()?;
         let vars = self.vars();
         let norm = if max_norm > 0.0 {
-            clip_grad_norm(&vars, max_norm)?
+            clip_grad_norm_store(&vars, &mut grads, max_norm)?
         } else {
-            grad_norm(&vars).unwrap_or(0.0)
+            grad_norm_from_store(&vars, &grads).unwrap_or(0.0)
         };
-        self.step_from_var_grads()?;
+        self.step_from_grads(&grads)?;
         Ok(norm)
     }
 
-    /// Save moments to `optimizer.safetensors` + `optim_meta.json`.
     pub fn save(&self, dir: &Path) -> Result<()> {
         std::fs::create_dir_all(dir)?;
         let mut tensors: HashMap<String, Tensor> = HashMap::new();
@@ -209,21 +193,17 @@ impl ResumableAdamW {
             eps: self.params.eps,
             weight_decay: self.params.weight_decay,
         };
-        std::fs::write(
-            dir.join("optim_meta.json"),
-            serde_json::to_string_pretty(&meta)?,
-        )?;
+        std::fs::write(dir.join("optim_meta.json"), serde_json::to_string_pretty(&meta)?)?;
         Ok(())
     }
 
-    /// Restore moments + step_t. Parameter names must match.
     pub fn load(&mut self, dir: &Path, device: &Device) -> Result<()> {
         let path = dir.join("optimizer.safetensors");
         if !path.exists() {
             bail!("optimizer.safetensors not found in {}", dir.display());
         }
-        let loaded = candle_core::safetensors::load(&path, device)
-            .context("load optimizer.safetensors")?;
+        let loaded =
+            candle_core::safetensors::load(&path, device).context("load optimizer.safetensors")?;
         for (i, (name, var)) in self.vars.iter().enumerate() {
             let mk = format!("{name}__m");
             let vk = format!("{name}__v");
@@ -247,7 +227,6 @@ impl ResumableAdamW {
         if meta_path.exists() {
             let meta: OptimMeta = serde_json::from_str(&std::fs::read_to_string(meta_path)?)?;
             self.step_t = meta.step_t;
-            // Keep current LR schedule control; restore hyperparams except lr
             self.params.beta1 = meta.beta1;
             self.params.beta2 = meta.beta2;
             self.params.eps = meta.eps;
@@ -257,8 +236,6 @@ impl ResumableAdamW {
     }
 }
 
-// ─── Train run state (step counter) ─────────────────────────────────────────
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrainState {
     pub step: usize,
@@ -267,10 +244,7 @@ pub struct TrainState {
 
 pub fn save_train_state(dir: &Path, state: &TrainState) -> Result<()> {
     std::fs::create_dir_all(dir)?;
-    std::fs::write(
-        dir.join("train_state.json"),
-        serde_json::to_string_pretty(state)?,
-    )?;
+    std::fs::write(dir.join("train_state.json"), serde_json::to_string_pretty(state)?)?;
     Ok(())
 }
 
@@ -282,7 +256,6 @@ pub fn load_train_state(dir: &Path) -> Result<Option<TrainState>> {
     Ok(Some(serde_json::from_str(&std::fs::read_to_string(p)?)?))
 }
 
-/// Legacy helper kept for callers that still use candle AdamW + GradMap path.
 pub fn backward_step_clipped(
     opt: &mut candle_nn::AdamW,
     loss: &Tensor,
@@ -290,9 +263,9 @@ pub fn backward_step_clipped(
     max_norm: f64,
 ) -> CResult<f64> {
     use candle_nn::Optimizer;
-    let grads = loss.backward()?;
+    let mut grads = loss.backward()?;
     let norm = if max_norm > 0.0 {
-        clip_grad_norm(vars, max_norm)?
+        clip_grad_norm_store(vars, &mut grads, max_norm)?
     } else {
         0.0
     };
