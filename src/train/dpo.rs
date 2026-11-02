@@ -28,7 +28,7 @@ fn softplus(x: &Tensor) -> candle_core::Result<Tensor> {
     let m = x.maximum(&zeros)?;
     let e1 = (x - &m)?.exp()?;
     let e0 = (zeros - &m)?.exp()?;
-    (m + (e0 + e1)?.log()?)?
+    Ok((m + (e0 + e1)?.log()?)?)
 }
 
 pub fn run(cfg: &TrainConfig, device: &Device) -> Result<()> {
